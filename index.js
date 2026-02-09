@@ -30,9 +30,44 @@ let currentConfig = {
     privateChat: true,
     groupAtOnly: true,
     userWhitelist: [768295235],
-    groupWhitelist: [902106123]
+    groupWhitelist: [902106123],
+    debounceMs: 2000
   }
 };
+
+// ========== 防抖 ==========
+const debounceBuffers = new Map(); // sessionBase -> { messages: [], media: [], timer, resolve }
+
+function debounceMessage(sessionBase, text, media, debounceMs) {
+  return new Promise((resolve) => {
+    let buf = debounceBuffers.get(sessionBase);
+    if (buf) {
+      // 追加到现有 buffer
+      if (text) buf.messages.push(text);
+      if (media.length > 0) buf.media.push(...media);
+      clearTimeout(buf.timer);
+      // 替换 resolve：前一个 promise 会 resolve(null) 被跳过
+      const prevResolve = buf.resolve;
+      buf.resolve = resolve;
+      prevResolve(null); // 告诉前一个调用者"被合并了"
+    } else {
+      buf = {
+        messages: text ? [text] : [],
+        media: [...media],
+        resolve
+      };
+      debounceBuffers.set(sessionBase, buf);
+    }
+
+    buf.timer = setTimeout(() => {
+      debounceBuffers.delete(sessionBase);
+      buf.resolve({
+        text: buf.messages.join('\n'),
+        media: buf.media
+      });
+    }, debounceMs);
+  });
+}
 
 // ========== Gateway WS RPC Client ==========
 
@@ -43,6 +78,7 @@ class GatewayClient {
     this.ws = null;
     this.pending = new Map(); // id -> { resolve, reject }
     this.eventHandlers = new Map(); // event -> handler
+    this.chatWaiters = new Map(); // runId -> { resolve, cleanup }
     this.connected = false;
     this.connectPromise = null;
     this.reconnectTimer = null;
@@ -133,6 +169,15 @@ class GatewayClient {
     // 3. Events (chat, agent, tick, etc.)
     if (frame.type === 'event' && frame.event) {
       if (frame.event === 'tick') return; // ignore heartbeat ticks
+
+      // Chat events: route by runId to specific waiters
+      if (frame.event === 'chat' && frame.payload?.runId) {
+        const waiter = this.chatWaiters.get(frame.payload.runId);
+        if (waiter) {
+          waiter.handler(frame.payload);
+        }
+      }
+
       const handler = this.eventHandlers.get(frame.event);
       if (handler) handler(frame.payload);
       return;
@@ -354,10 +399,15 @@ const plugin_onmessage = async (ctx, event) => {
     if (!shouldHandle) return;
 
     // 提取消息内容
-    const { extractedText, extractedMedia } = extractMessage(event.message || []);
-    const text = extractedText;
+    let { extractedText, extractedMedia } = extractMessage(event.message || []);
+    let text = extractedText;
 
-    if (!text && extractedMedia.length === 0) return;
+    // Debug: 记录未识别的消息段
+    if (!text && extractedMedia.length === 0) {
+      const rawSegs = (event.message || []).map(s => `${s.type}:${JSON.stringify(s.data).slice(0,120)}`);
+      if (rawSegs.length > 0) logger?.info(`[OpenClaw] 未提取到内容，原始段: ${rawSegs.join(' | ')}`);
+      return;
+    }
 
     const sessionBase = getSessionBase(messageType, userId, groupId);
 
@@ -378,28 +428,43 @@ const plugin_onmessage = async (ctx, event) => {
       // 其他命令（包括所有 OpenClaw 斜杠命令）都通过 chat.send 发给 gateway
     }
 
+    // ====== 防抖合并 ======
+    const debounceMs = currentConfig.behavior.debounceMs || 0;
+    if (debounceMs > 0 && !(text && text.startsWith('/'))) {
+      const merged = await debounceMessage(sessionBase, text, extractedMedia, debounceMs);
+      if (!merged) {
+        // 被合并到后续消息了，跳过
+        return;
+      }
+      // 用合并后的内容替换
+      extractedText = merged.text;
+      extractedMedia = merged.media;
+      text = extractedText;
+      if (!text && extractedMedia.length === 0) return;
+    }
+
     // ====== 构建消息 ======
     let openclawMessage = text || '';
     let imageAttachments = [];
 
     if (extractedMedia.length > 0) {
-      const imageMedia = extractedMedia.filter(m => m.type === 'image');
-      const nonImageMedia = extractedMedia.filter(m => m.type !== 'image');
+      // 下载所有媒体到 cache 目录
+      const savedMedia = await saveMediaToCache(extractedMedia, ctx);
 
-      // 保存图片到 workspace，agent 通过 read tool 看图
-      if (imageMedia.length > 0) {
-        const savedPaths = await saveImagesToWorkspace(imageMedia);
-        if (savedPaths.length > 0) {
-          const pathsText = savedPaths.map(p => `[用户发送了图片: ${p}]`).join('\n');
-          openclawMessage = openclawMessage ? `${openclawMessage}\n\n${pathsText}` : pathsText;
-          logger.info(`[OpenClaw] 已保存 ${savedPaths.length} 张图片到 workspace`);
-        }
-      }
-
-      // 非图片类当文本 URL 传
-      if (nonImageMedia.length > 0) {
-        const mediaInfo = nonImageMedia.map(m => `[${m.type}: ${m.url}]`).join('\n');
-        openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+      if (savedMedia.length > 0) {
+        const mediaDescriptions = savedMedia.map(m => {
+          if (m.path) {
+            if (m.type === 'image') return `[用户发送了图片: ${m.path}]`;
+            if (m.type === 'file') return `[用户发送了文件「${m.name}」: ${m.path}]`;
+            if (m.type === 'voice') return `[用户发送了语音: ${m.path}]`;
+            if (m.type === 'video') return `[用户发送了视频: ${m.path}]`;
+            return `[用户发送了${m.type}: ${m.path}]`;
+          }
+          return `[用户发送了${m.type}: ${m.url}]`;
+        });
+        const mediaText = mediaDescriptions.join('\n');
+        openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaText}` : mediaText;
+        logger.info(`[OpenClaw] 已保存 ${savedMedia.filter(m => m.path).length} 个媒体文件到 cache`);
       }
     }
 
@@ -417,50 +482,48 @@ const plugin_onmessage = async (ctx, event) => {
     try {
       const gw = await getGateway();
 
-      // 设置 chat event 监听（收集完整回复后一次性发送）
-      const replyPromise = new Promise((resolve) => {
-        const timeout = setTimeout(() => {
-          cleanup();
-          resolve(null);
-        }, 180000);
-
-        const cleanup = () => {
-          clearTimeout(timeout);
-          gw.eventHandlers.delete('chat');
-        };
-
-        gw.eventHandlers.set('chat', (payload) => {
-          if (!payload) return;
-          logger?.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0,8)}`);
-          if (payload.sessionKey !== sessionKey) return;
-
-          if (payload.state === 'final') {
-            // final 包含完整回复文本
-            const text = extractContentText(payload.message);
-            cleanup();
-            resolve(text?.trim() || null);
-          }
-
-          if (payload.state === 'aborted') {
-            cleanup();
-            resolve('⏹ 已中止');
-          }
-
-          if (payload.state === 'error') {
-            cleanup();
-            resolve(`❌ ${payload.errorMessage || '处理出错'}`);
-          }
-        });
-      });
-
-      // 发送消息
+      // 发送消息（先发，拿到真实 runId）
       const sendResult = await gw.request('chat.send', {
         sessionKey,
         message: openclawMessage,
         idempotencyKey: runId
       });
 
-      logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
+      const realRunId = sendResult?.runId || runId;
+      logger.info(`[OpenClaw] chat.send 已接受: runId=${realRunId}`);
+
+      // 注册按 runId 路由的 waiter
+      const replyPromise = new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+          gw.chatWaiters.delete(realRunId);
+          resolve(null);
+        }, 180000);
+
+        gw.chatWaiters.set(realRunId, {
+          handler: (payload) => {
+            logger?.info(`[OpenClaw] chat event: state=${payload.state} run=${realRunId.slice(0,8)}`);
+
+            if (payload.state === 'final') {
+              clearTimeout(timeout);
+              gw.chatWaiters.delete(realRunId);
+              const text = extractContentText(payload.message);
+              resolve(text?.trim() || null);
+            }
+
+            if (payload.state === 'aborted') {
+              clearTimeout(timeout);
+              gw.chatWaiters.delete(realRunId);
+              resolve('⏹ 已中止');
+            }
+
+            if (payload.state === 'error') {
+              clearTimeout(timeout);
+              gw.chatWaiters.delete(realRunId);
+              resolve(`❌ ${payload.errorMessage || '处理出错'}`);
+            }
+          }
+        });
+      });
 
       // 等待 event 回复
       const reply = await replyPromise;
@@ -581,7 +644,12 @@ function extractMessage(segments) {
         }
         break;
       case 'file':
-        if (seg.data?.url) media.push({ type: 'file', url: seg.data.url, name: seg.data?.name });
+        if (seg.data?.url) {
+          media.push({ type: 'file', url: seg.data.url, name: seg.data?.file || seg.data?.name });
+        } else if (seg.data?.file_id) {
+          // QQ 文件没有直接 URL，需要通过 API 获取；先记录 file_id
+          media.push({ type: 'file', file_id: seg.data.file_id, name: seg.data?.file || seg.data?.name });
+        }
         break;
       case 'record':
         if (seg.data?.url) media.push({ type: 'voice', url: seg.data.url });
@@ -758,34 +826,72 @@ function guessMimeFromUrl(url) {
   return map[ext] || 'image/png';
 }
 
-// 下载图片保存到插件 cache 目录，返回文件路径列表
+// 下载媒体文件保存到插件 cache 目录，返回文件路径列表
 let pluginDir = null;
 
-async function saveImagesToWorkspace(mediaList) {
-  const imgDir = path.join(pluginDir || '/tmp', 'cache', 'images');
-  if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
+async function saveMediaToCache(mediaList, ctx) {
+  const cacheDir = path.join(pluginDir || '/tmp', 'cache', 'media');
+  if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
   const saved = [];
   for (const m of mediaList) {
-    if (m.type !== 'image' || !m.url) continue;
     try {
-      const buf = await downloadToBuffer(m.url, 10 * 1024 * 1024);
-      const ext = guessMimeFromUrl(m.url).split('/')[1] || 'png';
+      let buf = null;
+
+      if (m.url) {
+        buf = await downloadToBuffer(m.url, 10 * 1024 * 1024);
+      } else if (m.file_id && ctx) {
+        // 通过 OneBot API 获取文件
+        try {
+          const fileInfo = await ctx.actions.call('get_file', {
+            file_id: m.file_id
+          }, ctx.adapterName, ctx.pluginManager?.config);
+          if (fileInfo?.file) {
+            // file 可能是本地路径
+            if (fs.existsSync(fileInfo.file)) {
+              buf = fs.readFileSync(fileInfo.file);
+            } else if (fileInfo.url) {
+              buf = await downloadToBuffer(fileInfo.url, 10 * 1024 * 1024);
+            } else if (fileInfo.base64) {
+              buf = Buffer.from(fileInfo.base64, 'base64');
+            }
+          }
+        } catch (e) {
+          logger?.warn(`[OpenClaw] get_file 失败: ${e.message}`);
+        }
+      }
+
+      if (!buf) {
+        saved.push({ type: m.type, path: null, url: m.url, name: m.name });
+        continue;
+      }
+      let ext = 'bin';
+      if (m.type === 'image') {
+        ext = guessMimeFromUrl(m.url).split('/')[1] || 'png';
+      } else if (m.name) {
+        ext = m.name.split('.').pop() || 'bin';
+      } else if (m.type === 'voice') {
+        ext = 'silk';
+      } else if (m.type === 'video') {
+        ext = 'mp4';
+      }
       const filename = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
-      const filepath = path.join(imgDir, filename);
+      const filepath = path.join(cacheDir, filename);
       fs.writeFileSync(filepath, buf);
-      saved.push(filepath);
-      logger?.info(`[OpenClaw] 图片已保存: ${filepath} (${(buf.length/1024).toFixed(0)}KB)`);
+      saved.push({ type: m.type, path: filepath, name: m.name || filename, size: buf.length });
+      logger?.info(`[OpenClaw] 文件已保存: ${filepath} (${(buf.length/1024).toFixed(0)}KB)`);
     } catch (e) {
-      logger?.warn(`[OpenClaw] 下载图片失败: ${e.message}`);
+      logger?.warn(`[OpenClaw] 下载文件失败: ${e.message}`);
+      // 回退为 URL
+      saved.push({ type: m.type, path: null, url: m.url, name: m.name });
     }
   }
 
-  // 清理 1 小时前的旧图片
+  // 清理 1 小时前的旧文件
   try {
     const cutoff = Date.now() - 3600000;
-    for (const f of fs.readdirSync(imgDir)) {
-      const fp = path.join(imgDir, f);
+    for (const f of fs.readdirSync(cacheDir)) {
+      const fp = path.join(cacheDir, f);
       const stat = fs.statSync(fp);
       if (stat.mtimeMs < cutoff) fs.unlinkSync(fp);
     }
