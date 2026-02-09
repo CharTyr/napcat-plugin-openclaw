@@ -1,7 +1,7 @@
 {
   "name": "napcat-plugin-openclaw",
   "plugin": "OpenClaw AI Channel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "index.mjs",
   "description": "将 QQ 变为 OpenClaw AI 助手通道，支持私聊/群聊、斜杠命令、输入状态",
@@ -15,7 +15,11 @@
     "ai"
   ],
   "napcat": {
-    "tags": ["AI", "工具", "自动化"],
+    "tags": [
+      "AI",
+      "工具",
+      "自动化"
+    ],
     "minVersion": "4.14.0",
     "homepage": ""
   },
