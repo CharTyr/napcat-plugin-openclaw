@@ -77,7 +77,7 @@ QQ 用户 ←→ NapCat ←→ 本插件 ←→ OpenClaw Gateway (WS RPC)
                                    AI Agent (Claude, etc.)
 ```
 
-插件通过 Gateway 的 `chat.send` RPC 方法发送消息，监听 `chat` event 帧接收流式回复。认证使用 challenge-response 协议。
+插件通过 Gateway 的 `chat.send` RPC 方法发送消息，监听 `chat` event 的 `final` 帧获取完整回复（非流式，一次性返回）。认证使用 challenge-response 协议。
 
 ## 📝 License
 
