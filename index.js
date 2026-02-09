@@ -188,6 +188,7 @@ class GatewayClient {
         const waiter = this.chatWaiters.get(frame.payload.runId);
         if (waiter) {
           waiter.handler(frame.payload);
+          return; // 已由 waiter 处理，跳过全局 handler
         }
       }
 
