@@ -7,6 +7,8 @@ import { promisify } from 'util';
 import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import http from 'http';
+import https from 'https';
 import WebSocket from 'ws';
 
 const execAsync = promisify(exec);
@@ -282,6 +284,8 @@ function getSessionKey(sessionBase) {
 const plugin_init = async (ctx) => {
   logger = ctx.logger;
   configPath = ctx.configPath;
+  // 插件根目录
+  pluginDir = new URL('.', import.meta.url).pathname;
   logger.info('[OpenClaw] QQ Channel 插件初始化中...');
 
   try {
@@ -375,10 +379,28 @@ const plugin_onmessage = async (ctx, event) => {
     }
 
     // ====== 构建消息 ======
-    let openclawMessage = text;
+    let openclawMessage = text || '';
+    let imageAttachments = [];
+
     if (extractedMedia.length > 0) {
-      const mediaInfo = extractedMedia.map(m => `[${m.type}: ${m.url}]`).join('\n');
-      openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+      const imageMedia = extractedMedia.filter(m => m.type === 'image');
+      const nonImageMedia = extractedMedia.filter(m => m.type !== 'image');
+
+      // 保存图片到 workspace，agent 通过 read tool 看图
+      if (imageMedia.length > 0) {
+        const savedPaths = await saveImagesToWorkspace(imageMedia);
+        if (savedPaths.length > 0) {
+          const pathsText = savedPaths.map(p => `[用户发送了图片: ${p}]`).join('\n');
+          openclawMessage = openclawMessage ? `${openclawMessage}\n\n${pathsText}` : pathsText;
+          logger.info(`[OpenClaw] 已保存 ${savedPaths.length} 张图片到 workspace`);
+        }
+      }
+
+      // 非图片类当文本 URL 传
+      if (nonImageMedia.length > 0) {
+        const mediaInfo = nonImageMedia.map(m => `[${m.type}: ${m.url}]`).join('\n');
+        openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+      }
     }
 
     logger.info(`[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 80)}`);
@@ -444,7 +466,22 @@ const plugin_onmessage = async (ctx, event) => {
       const reply = await replyPromise;
 
       if (reply) {
-        await sendReply(ctx, messageType, groupId, userId, reply);
+        // 提取回复中的图片
+        const { images: replyImages, cleanText } = extractImagesFromReply(reply);
+
+        // 先发文本
+        if (cleanText) {
+          await sendReply(ctx, messageType, groupId, userId, cleanText);
+        }
+
+        // 再发图片
+        for (const imgUrl of replyImages) {
+          try {
+            await sendImageMsg(ctx, messageType, groupId, userId, imgUrl);
+          } catch (e) {
+            logger?.warn(`[OpenClaw] 发送图片失败: ${e.message}`);
+          }
+        }
       } else {
         logger.info('[OpenClaw] 无回复内容');
       }
@@ -573,64 +610,213 @@ async function setTypingStatus(ctx, userId, typing) {
   }
 }
 
+// ========== 智能分段 ==========
+
+const MAX_CHUNK_LEN = 2000;
+
+function smartSplit(text) {
+  if (text.length <= MAX_CHUNK_LEN) return [text];
+
+  const chunks = [];
+  let remaining = text;
+
+  while (remaining.length > MAX_CHUNK_LEN) {
+    let cutAt = -1;
+
+    // 1. 代码块边界（找最后一个在限制内的 ``` 结束）
+    const codeBlockEnd = remaining.lastIndexOf('```\n', MAX_CHUNK_LEN);
+    if (codeBlockEnd > MAX_CHUNK_LEN * 0.3) {
+      cutAt = codeBlockEnd + 4;
+    }
+
+    // 2. 空行（段落边界）
+    if (cutAt === -1) {
+      const doubleNewline = remaining.lastIndexOf('\n\n', MAX_CHUNK_LEN);
+      if (doubleNewline > MAX_CHUNK_LEN * 0.3) {
+        cutAt = doubleNewline + 2;
+      }
+    }
+
+    // 3. 单个换行
+    if (cutAt === -1) {
+      const singleNewline = remaining.lastIndexOf('\n', MAX_CHUNK_LEN);
+      if (singleNewline > MAX_CHUNK_LEN * 0.3) {
+        cutAt = singleNewline + 1;
+      }
+    }
+
+    // 4. 句号/问号/感叹号
+    if (cutAt === -1) {
+      for (const sep of ['。', '！', '？', '. ', '! ', '? ']) {
+        const idx = remaining.lastIndexOf(sep, MAX_CHUNK_LEN);
+        if (idx > MAX_CHUNK_LEN * 0.3) {
+          cutAt = idx + sep.length;
+          break;
+        }
+      }
+    }
+
+    // 5. 硬切
+    if (cutAt === -1) cutAt = MAX_CHUNK_LEN;
+
+    chunks.push(remaining.slice(0, cutAt).trimEnd());
+    remaining = remaining.slice(cutAt).trimStart();
+  }
+
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
 // ========== 消息发送 ==========
 
 async function sendReply(ctx, messageType, groupId, userId, text) {
+  const chunks = smartSplit(text);
+  for (let i = 0; i < chunks.length; i++) {
+    if (messageType === 'group') {
+      await sendGroupMsg(ctx, groupId, chunks[i]);
+    } else {
+      await sendPrivateMsg(ctx, userId, chunks[i]);
+    }
+    if (i < chunks.length - 1) await sleep(500);
+  }
+}
+
+async function sendImageMsg(ctx, messageType, groupId, userId, imageUrl) {
+  const message = [{ type: 'image', data: { url: imageUrl } }];
   if (messageType === 'group') {
-    await sendGroupMsg(ctx, groupId, text);
+    await ctx.actions.call('send_group_msg', {
+      group_id: String(groupId),
+      message
+    }, ctx.adapterName, ctx.pluginManager?.config);
   } else {
-    await sendPrivateMsg(ctx, userId, text);
+    await ctx.actions.call('send_private_msg', {
+      user_id: String(userId),
+      message
+    }, ctx.adapterName, ctx.pluginManager?.config);
   }
 }
 
 async function sendGroupMsg(ctx, groupId, text) {
-  const maxLen = 3000;
-  if (text.length <= maxLen) {
-    await ctx.actions.call('send_group_msg', {
-      group_id: String(groupId),
-      message: text
-    }, ctx.adapterName, ctx.pluginManager?.config);
-  } else {
-    for (let i = 0; i < text.length; i += maxLen) {
-      const part = text.slice(i, i + maxLen);
-      const total = Math.ceil(text.length / maxLen);
-      const idx = Math.floor(i / maxLen) + 1;
-      const prefix = total > 1 ? `[${idx}/${total}]\n` : '';
-      await ctx.actions.call('send_group_msg', {
-        group_id: String(groupId),
-        message: prefix + part
-      }, ctx.adapterName, ctx.pluginManager?.config);
-      if (i + maxLen < text.length) await sleep(1000);
-    }
-  }
+  await ctx.actions.call('send_group_msg', {
+    group_id: String(groupId),
+    message: text
+  }, ctx.adapterName, ctx.pluginManager?.config);
 }
 
 async function sendPrivateMsg(ctx, userId, text) {
-  const maxLen = 3000;
-  if (text.length <= maxLen) {
-    await ctx.actions.call('send_private_msg', {
-      user_id: String(userId),
-      message: text
-    }, ctx.adapterName, ctx.pluginManager?.config);
-  } else {
-    for (let i = 0; i < text.length; i += maxLen) {
-      const part = text.slice(i, i + maxLen);
-      const total = Math.ceil(text.length / maxLen);
-      const idx = Math.floor(i / maxLen) + 1;
-      const prefix = total > 1 ? `[${idx}/${total}]\n` : '';
-      await ctx.actions.call('send_private_msg', {
-        user_id: String(userId),
-        message: prefix + part
-      }, ctx.adapterName, ctx.pluginManager?.config);
-      if (i + maxLen < text.length) await sleep(1000);
-    }
-  }
+  await ctx.actions.call('send_private_msg', {
+    user_id: String(userId),
+    message: text
+  }, ctx.adapterName, ctx.pluginManager?.config);
 }
 
 // ========== 工具函数 ==========
 
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
+}
+
+// 下载 URL 到 Buffer（5MB 限制，10 秒超时）
+function downloadToBuffer(url, maxBytes = 5 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const mod = url.startsWith('https') ? https : http;
+    const req = mod.get(url, { timeout: 10000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        // Follow redirect
+        downloadToBuffer(res.headers.location, maxBytes).then(resolve, reject);
+        res.resume();
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      const chunks = [];
+      let total = 0;
+      res.on('data', (chunk) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          res.destroy();
+          reject(new Error(`exceeds ${maxBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('error', reject);
+  });
+}
+
+// 从 URL 猜测 MIME 类型
+function guessMimeFromUrl(url) {
+  const ext = url.split('?')[0].split('.').pop()?.toLowerCase();
+  const map = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp' };
+  return map[ext] || 'image/png';
+}
+
+// 下载图片保存到插件 cache 目录，返回文件路径列表
+let pluginDir = null;
+
+async function saveImagesToWorkspace(mediaList) {
+  const imgDir = path.join(pluginDir || '/tmp', 'cache', 'images');
+  if (!fs.existsSync(imgDir)) fs.mkdirSync(imgDir, { recursive: true });
+
+  const saved = [];
+  for (const m of mediaList) {
+    if (m.type !== 'image' || !m.url) continue;
+    try {
+      const buf = await downloadToBuffer(m.url, 10 * 1024 * 1024);
+      const ext = guessMimeFromUrl(m.url).split('/')[1] || 'png';
+      const filename = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
+      const filepath = path.join(imgDir, filename);
+      fs.writeFileSync(filepath, buf);
+      saved.push(filepath);
+      logger?.info(`[OpenClaw] 图片已保存: ${filepath} (${(buf.length/1024).toFixed(0)}KB)`);
+    } catch (e) {
+      logger?.warn(`[OpenClaw] 下载图片失败: ${e.message}`);
+    }
+  }
+
+  // 清理 1 小时前的旧图片
+  try {
+    const cutoff = Date.now() - 3600000;
+    for (const f of fs.readdirSync(imgDir)) {
+      const fp = path.join(imgDir, f);
+      const stat = fs.statSync(fp);
+      if (stat.mtimeMs < cutoff) fs.unlinkSync(fp);
+    }
+  } catch (_) {}
+
+  return saved;
+}
+
+// 从 agent 回复中提取图片 URL（MEDIA:xxx 或 ![alt](url)）
+function extractImagesFromReply(text) {
+  const images = [];
+  // MEDIA: lines
+  const mediaRegex = /^MEDIA:\s*(.+)$/gm;
+  let match;
+  while ((match = mediaRegex.exec(text)) !== null) {
+    const url = match[1].trim();
+    if (url.startsWith('http')) images.push(url);
+  }
+  // Markdown images
+  const mdRegex = /!\[[^\]]*\]\(([^)]+)\)/g;
+  while ((match = mdRegex.exec(text)) !== null) {
+    const url = match[1].trim();
+    if (url.startsWith('http')) images.push(url);
+  }
+  // Remove matched patterns from text
+  let cleanText = text
+    .replace(/^MEDIA:\s*.+$/gm, '')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return { images, cleanText };
 }
 
 function deepMerge(target, source) {
