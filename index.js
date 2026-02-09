@@ -351,6 +351,21 @@ const plugin_init = async (ctx) => {
     logger.error(`[OpenClaw] Gateway 预连接失败: ${e.message}（将在首次消息时重试）`);
   }
 
+  // 构建 WebUI 配置面板
+  if (ctx.NapCatConfig) {
+    const C = ctx.NapCatConfig;
+    plugin_config_ui = C.combine(
+      C.html('<div style="padding: 10px; background: rgba(0,0,0,0.05); border-radius: 8px;"><h3>🤖 OpenClaw AI Channel</h3><p>将 QQ 变为 OpenClaw AI 助手通道</p></div>'),
+      C.text('openclaw.token', 'Gateway Token', currentConfig.openclaw.token, 'OpenClaw Gateway 认证 Token'),
+      C.text('openclaw.gatewayUrl', 'Gateway URL', currentConfig.openclaw.gatewayUrl, 'Gateway WebSocket 地址'),
+      C.boolean('behavior.privateChat', '接收私聊消息', currentConfig.behavior.privateChat, '是否处理私聊消息'),
+      C.boolean('behavior.groupAtOnly', '群聊仅@触发', currentConfig.behavior.groupAtOnly, '群聊中仅在被@时回复'),
+      C.text('behavior.userWhitelist', '用户白名单', currentConfig.behavior.userWhitelist.join(','), 'QQ 号逗号分隔，留空允许所有'),
+      C.text('behavior.groupWhitelist', '群白名单', currentConfig.behavior.groupWhitelist.join(','), '群号逗号分隔，留空允许所有'),
+      C.text('behavior.debounceMs', '防抖时长(ms)', String(currentConfig.behavior.debounceMs || 2000), '快速连发消息的合并等待时间')
+    );
+  }
+
   logger.info(`[OpenClaw] 网关: ${currentConfig.openclaw.gatewayUrl}`);
   logger.info('[OpenClaw] 模式: 私聊全透传 + 群聊@触发 + 命令透传');
   logger.info('[OpenClaw] QQ Channel 插件初始化完成');
@@ -942,7 +957,29 @@ function deepMerge(target, source) {
 let plugin_config_ui = [];
 const plugin_get_config = async () => currentConfig;
 const plugin_set_config = async (ctx, config) => {
-  currentConfig = config;
+  // WebUI 传来的是扁平 key-value，需要转换
+  if (config['openclaw.token'] !== undefined || config['behavior.privateChat'] !== undefined) {
+    // 扁平格式，映射回嵌套结构
+    if (config['openclaw.token'] !== undefined) currentConfig.openclaw.token = config['openclaw.token'];
+    if (config['openclaw.gatewayUrl'] !== undefined) currentConfig.openclaw.gatewayUrl = config['openclaw.gatewayUrl'];
+    if (config['behavior.privateChat'] !== undefined) currentConfig.behavior.privateChat = config['behavior.privateChat'];
+    if (config['behavior.groupAtOnly'] !== undefined) currentConfig.behavior.groupAtOnly = config['behavior.groupAtOnly'];
+    if (config['behavior.userWhitelist'] !== undefined) {
+      const v = config['behavior.userWhitelist'];
+      currentConfig.behavior.userWhitelist = typeof v === 'string' ? v.split(',').map(Number).filter(Boolean) : (Array.isArray(v) ? v : []);
+    }
+    if (config['behavior.groupWhitelist'] !== undefined) {
+      const v = config['behavior.groupWhitelist'];
+      currentConfig.behavior.groupWhitelist = typeof v === 'string' ? v.split(',').map(Number).filter(Boolean) : (Array.isArray(v) ? v : []);
+    }
+    if (config['behavior.debounceMs'] !== undefined) {
+      currentConfig.behavior.debounceMs = parseInt(config['behavior.debounceMs']) || 2000;
+    }
+  } else {
+    // 已经是嵌套格式
+    currentConfig = deepMerge(currentConfig, config);
+  }
+
   // 重连 gateway
   if (gatewayClient) {
     gatewayClient.disconnect();
@@ -952,7 +989,7 @@ const plugin_set_config = async (ctx, config) => {
     try {
       const dir = path.dirname(ctx.configPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(ctx.configPath, JSON.stringify(config, null, 2), 'utf-8');
+      fs.writeFileSync(ctx.configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
     } catch (e) {
       logger?.error('[OpenClaw] 保存配置失败: ' + e.message);
     }
