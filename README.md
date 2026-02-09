@@ -9,9 +9,16 @@
 - **私聊全透传** — 白名单内用户的私聊消息直接转发给 OpenClaw Agent
 - **群聊 @触发** — 群聊中仅 @bot 时触发回复
 - **斜杠命令** — `/status`、`/model`、`/think`、`/verbose`、`/new`、`/stop` 等，与 OpenClaw TUI 完全一致
+- **图片/文件支持** — QQ 发图/文件自动下载缓存，Agent 可直接读取；Agent 回复中的图片自动发送到 QQ
+- **智能分段** — 超长回复按代码块 > 段落 > 句号智能切割，不在代码块中间断开
+- **消息防抖** — 快速连发的消息自动合并为一条请求（可配置时间窗口）
 - **输入状态** — 私聊中显示"对方正在输入..."
+- **WS 心跳自动重连** — 15 秒心跳检测，断线 5 秒后自动重连，无需人工干预
+- **Agent 主动推送** — Agent 端向 QQ session 发送的消息自动推送到对应 QQ 用户/群
+- **群聊 Session 模式** — 可选每人独立 session 或群共享 session
+- **WebUI 配置面板** — 在 NapCat WebUI 中直接配置所有选项
+- **Token 脱敏** — WebUI 中 Gateway Token 显示为脱敏格式
 - **CLI 回退** — Gateway WS 断连时自动回退到 `openclaw agent` CLI
-- **长消息分片** — 超长回复自动分段发送
 
 ## 📦 安装
 
@@ -40,11 +47,17 @@ pnpm build
 |--------|------|--------|
 | `openclaw.token` | OpenClaw Gateway 认证 Token | （必填） |
 | `openclaw.gatewayUrl` | Gateway WebSocket 地址 | `ws://127.0.0.1:18789` |
-| `openclaw.cliPath` | openclaw CLI 路径（回退用） | `/root/.nvm/.../openclaw` |
 | `behavior.privateChat` | 是否接收私聊消息 | `true` |
 | `behavior.groupAtOnly` | 群聊仅 @bot 触发 | `true` |
-| `behavior.userWhitelist` | 用户白名单（QQ号数组） | `[]`（全部允许） |
-| `behavior.groupWhitelist` | 群白名单（群号数组） | `[]`（全部允许） |
+| `behavior.userWhitelist` | 用户白名单（QQ号，逗号分隔） | 空（全部允许） |
+| `behavior.groupWhitelist` | 群白名单（群号，逗号分隔） | 空（全部允许） |
+| `behavior.debounceMs` | 消息防抖时长（毫秒） | `2000` |
+| `behavior.groupSessionMode` | 群聊 Session 模式 | `user`（每人独立） |
+
+### 群聊 Session 模式
+
+- **`user`**（默认）— 每个群成员拥有独立的对话上下文
+- **`shared`** — 整个群共享同一个对话上下文，所有成员的消息都在同一个 session 中
 
 ## 🔧 前置要求
 
@@ -77,7 +90,12 @@ QQ 用户 ←→ NapCat ←→ 本插件 ←→ OpenClaw Gateway (WS RPC)
                                    AI Agent (Claude, etc.)
 ```
 
-插件通过 Gateway 的 `chat.send` RPC 方法发送消息，监听 `chat` event 的 `final` 帧获取完整回复（非流式，一次性返回）。认证使用 challenge-response 协议。
+- **入站消息**：插件通过 Gateway 的 `chat.send` RPC 方法发送消息
+- **回复接收**：监听 `chat` event 的 `final` 帧获取完整回复（非流式，一次性返回）
+- **图片处理**：下载到插件 `cache/media/` 目录，Agent 通过 `read` tool 直接读取
+- **认证协议**：Gateway WS challenge-response 协议
+- **心跳机制**：15s ping/pong + 30s 超时检测 + 5s 自动重连
+- **并发处理**：按 `runId` 路由 event，支持多消息并发处理
 
 ## 📝 License
 

@@ -9,13 +9,24 @@ export interface PluginConfig {
     groupAtOnly: boolean;
     userWhitelist: number[];
     groupWhitelist: number[];
+    debounceMs: number;
+    groupSessionMode: 'user' | 'shared';
   };
 }
 
 export interface ExtractedMedia {
   type: 'image' | 'file' | 'voice' | 'video';
-  url: string;
+  url?: string;
+  file_id?: string;
   name?: string;
+}
+
+export interface SavedMedia {
+  type: string;
+  path: string | null;
+  url?: string;
+  name?: string;
+  size?: number;
 }
 
 export interface ExtractedMessage {
@@ -32,11 +43,18 @@ export interface ChatEventPayload {
 }
 
 export interface MessageContent {
+  role?: string;
   content?: ContentBlock[] | ContentBlock;
+  text?: string;
   stopReason?: string;
 }
 
 export interface ContentBlock {
   type?: string;
   text?: string;
+}
+
+export interface DebounceResult {
+  text: string;
+  media: ExtractedMedia[];
 }

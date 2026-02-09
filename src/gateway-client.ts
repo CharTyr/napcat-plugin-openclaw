@@ -6,16 +6,25 @@ interface PendingRequest {
   reject: (err: Error) => void;
 }
 
+interface ChatWaiter {
+  handler: (payload: any) => void;
+}
+
 export class GatewayClient {
   private url: string;
   private token: string;
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   public eventHandlers = new Map<string, (payload: any) => void>();
+  public chatWaiters = new Map<string, ChatWaiter>();
   private _connected = false;
   private connectPromise: Promise<void> | null = null;
   private connectNonce: string | null = null;
   private logger: any;
+  private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private lastPong = 0;
+  private _destroyed = false;
 
   constructor(url: string, token: string, logger?: any) {
     this.url = url;
@@ -63,10 +72,12 @@ export class GatewayClient {
         this.logger?.info(`[OpenClaw] WS 关闭: ${code} ${reason}`);
         this._connected = false;
         this.connectPromise = null;
+        this.stopHeartbeat();
         for (const [, p] of this.pending) {
           p.reject(new Error(`ws closed: ${code}`));
         }
         this.pending.clear();
+        this.scheduleReconnect();
       });
 
       this.ws.on('error', (err: Error) => {
@@ -74,7 +85,9 @@ export class GatewayClient {
         clearTimeout(timeout);
         this._connected = false;
         this.connectPromise = null;
+        this.stopHeartbeat();
         reject(err);
+        this.scheduleReconnect();
       });
     });
 
@@ -87,6 +100,8 @@ export class GatewayClient {
     connectReject: (err: Error) => void,
     connectTimeout: NodeJS.Timeout
   ): void {
+    this.lastPong = Date.now();
+
     // Challenge event
     if (frame.type === 'event' && frame.event === 'connect.challenge') {
       this.connectNonce = frame.payload?.nonce;
@@ -111,9 +126,18 @@ export class GatewayClient {
       return;
     }
 
-    // Events (chat, agent, tick, etc.)
+    // Events
     if (frame.type === 'event' && frame.event) {
       if (frame.event === 'tick') return;
+
+      // Chat events: route by runId to specific waiters
+      if (frame.event === 'chat' && frame.payload?.runId) {
+        const waiter = this.chatWaiters.get(frame.payload.runId);
+        if (waiter) {
+          waiter.handler(frame.payload);
+        }
+      }
+
       const handler = this.eventHandlers.get(frame.event);
       if (handler) handler(frame.payload);
     }
@@ -131,7 +155,7 @@ export class GatewayClient {
       client: {
         id: 'gateway-client',
         displayName: 'QQ Channel',
-        version: '1.0.0',
+        version: '1.3.0',
         platform: 'linux',
         mode: 'backend',
       },
@@ -149,6 +173,7 @@ export class GatewayClient {
         this._connected = true;
         this.connectPromise = null;
         this.logger?.info('[OpenClaw] Gateway 认证成功');
+        this.startHeartbeat();
         resolve();
       },
       reject: (err: Error) => {
@@ -162,6 +187,48 @@ export class GatewayClient {
 
     this.ws!.send(JSON.stringify(frame));
     this.logger?.info('[OpenClaw] 已发送 connect 请求');
+  }
+
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.lastPong = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this._connected || this.ws?.readyState !== WebSocket.OPEN) {
+        this.stopHeartbeat();
+        return;
+      }
+      if (Date.now() - this.lastPong > 30000) {
+        this.logger?.warn('[OpenClaw] 心跳超时，关闭连接');
+        this.ws?.close(4000, 'heartbeat timeout');
+        return;
+      }
+      try { this.ws!.ping(); } catch {}
+    }, 15000);
+
+    this.ws?.on('pong', () => { this.lastPong = Date.now(); });
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this._destroyed) return;
+    if (this.reconnectTimer) return;
+    this.logger?.info('[OpenClaw] 5 秒后自动重连...');
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.connect();
+        this.logger?.info('[OpenClaw] 自动重连成功');
+      } catch (e: any) {
+        this.logger?.warn(`[OpenClaw] 自动重连失败: ${e.message}`);
+        this.scheduleReconnect();
+      }
+    }, 5000);
   }
 
   async request(method: string, params: any): Promise<any> {
@@ -178,7 +245,7 @@ export class GatewayClient {
         reject(new Error(`request timeout: ${method}`));
       }, 180000);
 
-            this.pending.set(id, {
+      this.pending.set(id, {
         resolve: (payload: any) => {
           clearTimeout(timeout);
           resolve(payload);
@@ -194,10 +261,14 @@ export class GatewayClient {
   }
 
   disconnect(): void {
+    this._destroyed = true;
+    this.stopHeartbeat();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
-      try {
-        this.ws.close(1000, 'plugin cleanup');
-      } catch {}
+      try { this.ws.close(1000, 'plugin cleanup'); } catch {}
       this.ws = null;
     }
     this._connected = false;

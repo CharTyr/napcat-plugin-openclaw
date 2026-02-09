@@ -31,9 +31,12 @@ let currentConfig = {
     groupAtOnly: true,
     userWhitelist: [768295235],
     groupWhitelist: [902106123],
-    debounceMs: 2000
+    debounceMs: 2000,
+    groupSessionMode: 'user' // 'user' = 每人独立 session, 'shared' = 共享群 session
   }
 };
+
+let lastCtx = null; // 保存最近的 plugin ctx，用于主动推送
 
 // ========== 防抖 ==========
 const debounceBuffers = new Map(); // sessionBase -> { messages: [], media: [], timer, resolve }
@@ -83,6 +86,9 @@ class GatewayClient {
     this.connectPromise = null;
     this.reconnectTimer = null;
     this.connectNonce = null;
+    this.heartbeatTimer = null;
+    this.lastPong = 0;
+    this._destroyed = false;
   }
 
   async connect() {
@@ -121,11 +127,14 @@ class GatewayClient {
         logger?.info(`[OpenClaw] WS 关闭: ${code} ${reason}`);
         this.connected = false;
         this.connectPromise = null;
+        this._stopHeartbeat();
         // reject all pending
         for (const [id, p] of this.pending) {
           p.reject(new Error(`ws closed: ${code}`));
         }
         this.pending.clear();
+        // 自动重连
+        this._scheduleReconnect();
       });
 
       this.ws.on('error', (err) => {
@@ -133,7 +142,9 @@ class GatewayClient {
         clearTimeout(timeout);
         this.connected = false;
         this.connectPromise = null;
+        this._stopHeartbeat();
         reject(err);
+        this._scheduleReconnect();
       });
     });
 
@@ -141,6 +152,8 @@ class GatewayClient {
   }
 
   _handleFrame(frame, connectResolve, connectReject, connectTimeout) {
+    this.lastPong = Date.now(); // 收到任何帧都算活跃
+
     // 1. Challenge event
     if (frame.type === 'event' && frame.event === 'connect.challenge') {
       this.connectNonce = frame.payload?.nonce;
@@ -213,6 +226,7 @@ class GatewayClient {
         this.connected = true;
         this.connectPromise = null;
         logger?.info('[OpenClaw] Gateway 认证成功');
+        this._startHeartbeat();
         resolve();
       },
       reject: (err) => {
@@ -252,7 +266,55 @@ class GatewayClient {
     });
   }
 
+  _startHeartbeat() {
+    this._stopHeartbeat();
+    this.lastPong = Date.now();
+    this.heartbeatTimer = setInterval(() => {
+      if (!this.connected || this.ws?.readyState !== WebSocket.OPEN) {
+        this._stopHeartbeat();
+        return;
+      }
+      // 如果 30 秒没收到任何帧，认为连接已死
+      if (Date.now() - this.lastPong > 30000) {
+        logger?.warn('[OpenClaw] 心跳超时，关闭连接');
+        this.ws?.close(4000, 'heartbeat timeout');
+        return;
+      }
+      // 发 ping
+      try { this.ws.ping(); } catch {}
+    }, 15000);
+
+    // pong 更新时间
+    this.ws?.on('pong', () => { this.lastPong = Date.now(); });
+  }
+
+  _stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+  }
+
+  _scheduleReconnect() {
+    if (this._destroyed) return;
+    if (this.reconnectTimer) return;
+    logger?.info('[OpenClaw] 5 秒后自动重连...');
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      try {
+        await this.connect();
+        logger?.info('[OpenClaw] 自动重连成功');
+      } catch (e) {
+        logger?.warn(`[OpenClaw] 自动重连失败: ${e.message}`);
+        this._scheduleReconnect(); // 继续重试
+      }
+    }, 5000);
+  }
+
   disconnect() {
+    this._destroyed = true;
+    this._stopHeartbeat();
+    if (this.reconnectTimer) { clearTimeout(this.reconnectTimer); this.reconnectTimer = null; }
     if (this.ws) {
       try { this.ws.close(1000, 'plugin cleanup'); } catch {}
       this.ws = null;
@@ -273,8 +335,52 @@ async function getGateway() {
   }
   if (!gatewayClient.connected) {
     await gatewayClient.connect();
+    // 注册全局 chat listener 用于 agent 主动推送
+    setupAgentPushListener(gatewayClient);
   }
   return gatewayClient;
+}
+
+// Agent 主动推送：监听非插件发起的 chat final events，推送到 QQ
+function setupAgentPushListener(gw) {
+  gw.eventHandlers.set('chat', (payload) => {
+    if (!payload || !payload.sessionKey) return;
+    // 只处理 final 状态
+    if (payload.state !== 'final') return;
+    // 只处理 qq-* session
+    if (!payload.sessionKey.startsWith('qq-')) return;
+    // 如果有对应的 chatWaiter，说明是我们发起的请求，跳过
+    if (payload.runId && gw.chatWaiters.has(payload.runId)) return;
+
+    const text = extractContentText(payload.message);
+    if (!text?.trim()) return;
+
+    // 解析 sessionKey 得到发送目标
+    const sk = payload.sessionKey;
+    if (!lastCtx) return;
+
+    logger?.info(`[OpenClaw] Agent 主动推送: ${sk} -> ${text.slice(0, 50)}`);
+
+    // qq-{userId} → 私聊
+    const privateMatch = sk.match(/^qq-(\d+)(?:-\d+)?$/);
+    if (privateMatch && !sk.includes('-g')) {
+      const userId = privateMatch[1];
+      const { images, cleanText } = extractImagesFromReply(text.trim());
+      if (cleanText) sendPrivateMsg(lastCtx, userId, cleanText).catch(e => logger?.warn(`[OpenClaw] 推送失败: ${e.message}`));
+      for (const img of images) sendImageMsg(lastCtx, 'private', null, userId, img).catch(() => {});
+      return;
+    }
+
+    // qq-g{groupId} or qq-g{groupId}-{userId} → 群聊
+    const groupMatch = sk.match(/^qq-g(\d+)/);
+    if (groupMatch) {
+      const groupId = groupMatch[1];
+      const { images, cleanText } = extractImagesFromReply(text.trim());
+      if (cleanText) sendGroupMsg(lastCtx, groupId, cleanText).catch(e => logger?.warn(`[OpenClaw] 推送失败: ${e.message}`));
+      for (const img of images) sendImageMsg(lastCtx, 'group', groupId, null, img).catch(() => {});
+      return;
+    }
+  });
 }
 
 // ========== 斜杠命令（仅插件本地处理的） ==========
@@ -316,6 +422,10 @@ const LOCAL_COMMANDS = {
 
 function getSessionBase(messageType, userId, groupId) {
   if (messageType === 'private') return `qq-${userId}`;
+  // 群聊 session 模式
+  if (currentConfig.behavior.groupSessionMode === 'shared') {
+    return `qq-g${groupId}`;
+  }
   return `qq-g${groupId}-${userId}`;
 }
 
@@ -356,13 +466,17 @@ const plugin_init = async (ctx) => {
     const C = ctx.NapCatConfig;
     plugin_config_ui = C.combine(
       C.html('<div style="padding: 10px; background: rgba(0,0,0,0.05); border-radius: 8px;"><h3>🤖 OpenClaw AI Channel</h3><p>将 QQ 变为 OpenClaw AI 助手通道</p></div>'),
-      C.text('openclaw.token', 'Gateway Token', currentConfig.openclaw.token, 'OpenClaw Gateway 认证 Token'),
+      C.text('openclaw.token', 'Gateway Token', currentConfig.openclaw.token, 'OpenClaw Gateway 认证 Token（保存后不显示明文）'),
       C.text('openclaw.gatewayUrl', 'Gateway URL', currentConfig.openclaw.gatewayUrl, 'Gateway WebSocket 地址'),
       C.boolean('behavior.privateChat', '接收私聊消息', currentConfig.behavior.privateChat, '是否处理私聊消息'),
       C.boolean('behavior.groupAtOnly', '群聊仅@触发', currentConfig.behavior.groupAtOnly, '群聊中仅在被@时回复'),
       C.text('behavior.userWhitelist', '用户白名单', currentConfig.behavior.userWhitelist.join(','), 'QQ 号逗号分隔，留空允许所有'),
       C.text('behavior.groupWhitelist', '群白名单', currentConfig.behavior.groupWhitelist.join(','), '群号逗号分隔，留空允许所有'),
-      C.text('behavior.debounceMs', '防抖时长(ms)', String(currentConfig.behavior.debounceMs || 2000), '快速连发消息的合并等待时间')
+      C.text('behavior.debounceMs', '防抖时长(ms)', String(currentConfig.behavior.debounceMs || 2000), '快速连发消息的合并等待时间'),
+      C.select('behavior.groupSessionMode', '群聊 Session 模式', [
+        { label: '每人独立', value: 'user' },
+        { label: '群共享', value: 'shared' }
+      ], currentConfig.behavior.groupSessionMode || 'user', '群聊中每个成员独立对话 或 整群共享上下文')
     );
   }
 
@@ -374,6 +488,7 @@ const plugin_init = async (ctx) => {
 const plugin_onmessage = async (ctx, event) => {
   try {
     if (!logger) return;
+    lastCtx = ctx; // 保存用于主动推送
     if (event.post_type !== 'message') return;
 
     const userId = event.user_id;
@@ -955,12 +1070,23 @@ function deepMerge(target, source) {
 // ========== 配置 ==========
 
 let plugin_config_ui = [];
-const plugin_get_config = async () => currentConfig;
+const plugin_get_config = async () => {
+  // 脱敏 token
+  const config = JSON.parse(JSON.stringify(currentConfig));
+  if (config.openclaw?.token) {
+    const t = config.openclaw.token;
+    config.openclaw.token = t.length > 8 ? t.slice(0, 4) + '****' + t.slice(-4) : '****';
+  }
+  return config;
+};
 const plugin_set_config = async (ctx, config) => {
   // WebUI 传来的是扁平 key-value，需要转换
   if (config['openclaw.token'] !== undefined || config['behavior.privateChat'] !== undefined) {
     // 扁平格式，映射回嵌套结构
-    if (config['openclaw.token'] !== undefined) currentConfig.openclaw.token = config['openclaw.token'];
+    if (config['openclaw.token'] !== undefined) {
+      const t = config['openclaw.token'];
+      if (!t.includes('****')) currentConfig.openclaw.token = t;
+    }
     if (config['openclaw.gatewayUrl'] !== undefined) currentConfig.openclaw.gatewayUrl = config['openclaw.gatewayUrl'];
     if (config['behavior.privateChat'] !== undefined) currentConfig.behavior.privateChat = config['behavior.privateChat'];
     if (config['behavior.groupAtOnly'] !== undefined) currentConfig.behavior.groupAtOnly = config['behavior.groupAtOnly'];
@@ -974,6 +1100,9 @@ const plugin_set_config = async (ctx, config) => {
     }
     if (config['behavior.debounceMs'] !== undefined) {
       currentConfig.behavior.debounceMs = parseInt(config['behavior.debounceMs']) || 2000;
+    }
+    if (config['behavior.groupSessionMode'] !== undefined) {
+      currentConfig.behavior.groupSessionMode = config['behavior.groupSessionMode'];
     }
   } else {
     // 已经是嵌套格式
