@@ -178,7 +178,7 @@ export class GatewayClient {
         reject(new Error(`request timeout: ${method}`));
       }, 180000);
 
-      this.pending.set(id, {
+            this.pending.set(id, {
         resolve: (payload: any) => {
           clearTimeout(timeout);
           resolve(payload);

@@ -140,7 +140,7 @@ function extractTextFromPayload(message: any): string {
   if (!message) return '';
 
   const content = message.content;
-  if (!content) return '';
+  if (!content) return message.text ?? '';
 
   const blocks: any[] = Array.isArray(content) ? content : [content];
   let text = '';
@@ -149,6 +149,10 @@ function extractTextFromPayload(message: any): string {
     else if (b?.text) text += b.text;
   }
   return text;
+}
+
+function extractContentText(message: any): string {
+  return extractTextFromPayload(message);
 }
 
 // ========== Typing Status ==========
@@ -307,18 +311,18 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
     if (messageType === 'private') setTypingStatus(ctx, userId, true);
 
-    // Send via Gateway RPC
+    // Send via Gateway RPC + event listener (non-streaming)
     const sessionKey = getSessionKey(sessionBase);
     const runId = randomUUID();
 
     try {
       const gw = await getGateway();
 
+      // Listen for chat events — only use final (contains full text)
       const replyPromise = new Promise<string | null>((resolve) => {
-        let replyText = '';
         const timeout = setTimeout(() => {
           cleanup();
-          resolve(replyText.trim() || null);
+          resolve(null);
         }, 180000);
 
         const cleanup = () => {
@@ -326,42 +330,41 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
           gw.eventHandlers.delete('chat');
         };
 
-        gw.eventHandlers.set('chat', (payload: ChatEventPayload) => {
-          if (!payload || payload.sessionKey !== sessionKey) return;
-
-          if (payload.state === 'delta') {
-            replyText += extractTextFromPayload(payload.message);
-          }
+        gw.eventHandlers.set('chat', (payload: any) => {
+          if (!payload) return;
+          logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
+          if (payload.sessionKey !== sessionKey) return;
 
           if (payload.state === 'final') {
-            if (!replyText && payload.message) {
-              replyText = extractTextFromPayload(payload.message);
-            }
+            const text = extractContentText(payload.message);
             cleanup();
-            resolve(replyText.trim() || null);
+            resolve(text?.trim() || null);
           }
 
           if (payload.state === 'aborted') {
             cleanup();
-            resolve(replyText.trim() || '⏹ 已中止');
+            resolve('⏹ 已中止');
           }
 
           if (payload.state === 'error') {
             cleanup();
-            resolve(replyText.trim() || `❌ ${payload.errorMessage || '处理出错'}`);
+            resolve(`❌ ${payload.errorMessage || '处理出错'}`);
           }
         });
       });
 
-      const result = await gw.request('chat.send', {
+      // Send message
+      const sendResult = await gw.request('chat.send', {
         sessionKey,
         message: openclawMessage,
         idempotencyKey: runId,
       });
 
-      logger.info(`[OpenClaw] chat.send: runId=${result?.runId} status=${result?.status}`);
+      logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
 
+      // Wait for final event
       const reply = await replyPromise;
+
       if (reply) {
         await sendReply(ctx, messageType, groupId, userId, reply);
       } else {
@@ -369,7 +372,6 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       }
     } catch (e: any) {
       logger.error(`[OpenClaw] 发送失败: ${e.message}`);
-      // Disconnect and fallback to CLI
       if (gatewayClient) {
         gatewayClient.disconnect();
         gatewayClient = null;

@@ -111,14 +111,17 @@ class GatewayClient {
       return;
     }
 
-    // 2. Response to a pending request
+    // Response to a pending request
     if (frame.type === 'res' && frame.id) {
       const pending = this.pending.get(frame.id);
       if (pending) {
-        this.pending.delete(frame.id);
         if (frame.ok !== false) {
+          // If expectFinal, skip "accepted"/"started" and wait for final response
+          if (pending.expectFinal && (frame.payload?.status === 'accepted' || frame.payload?.status === 'started')) return;
+          this.pending.delete(frame.id);
           pending.resolve(frame.payload);
         } else {
+          this.pending.delete(frame.id);
           pending.reject(new Error(frame.error?.message || `request failed: ${JSON.stringify(frame.error)}`));
         }
       }
@@ -178,7 +181,7 @@ class GatewayClient {
     logger?.info('[OpenClaw] 已发送 connect 请求');
   }
 
-  async request(method, params) {
+  async request(method, params, opts) {
     if (!this.connected || this.ws?.readyState !== WebSocket.OPEN) {
       await this.connect();
     }
@@ -194,7 +197,8 @@ class GatewayClient {
 
       this.pending.set(id, {
         resolve: (payload) => { clearTimeout(timeout); resolve(payload); },
-        reject: (err) => { clearTimeout(timeout); reject(err); }
+        reject: (err) => { clearTimeout(timeout); reject(err); },
+        expectFinal: opts?.expectFinal,
       });
 
       this.ws.send(JSON.stringify(frame));
@@ -384,19 +388,18 @@ const plugin_onmessage = async (ctx, event) => {
       setTypingStatus(ctx, userId, true);
     }
 
-    // ====== 通过 Gateway RPC chat.send ======
+    // ====== 通过 Gateway RPC chat.send + event 监听 ======
     const sessionKey = getSessionKey(sessionBase);
     const runId = randomUUID();
 
     try {
       const gw = await getGateway();
 
-      // 收集回复的 Promise
-      const replyPromise = new Promise((resolve, reject) => {
-        let replyText = '';
+      // 设置 chat event 监听（收集完整回复后一次性发送）
+      const replyPromise = new Promise((resolve) => {
         const timeout = setTimeout(() => {
           cleanup();
-          resolve(replyText.trim() || null);
+          resolve(null);
         }, 180000);
 
         const cleanup = () => {
@@ -404,63 +407,40 @@ const plugin_onmessage = async (ctx, event) => {
           gw.eventHandlers.delete('chat');
         };
 
-        // 监听 chat events
         gw.eventHandlers.set('chat', (payload) => {
-          if (!payload || payload.sessionKey !== sessionKey) return;
-
-          if (payload.state === 'delta') {
-            // delta message 可能是字符串或对象
-            if (typeof payload.message === 'string') {
-              replyText += payload.message;
-            } else if (payload.message?.content) {
-              // content block format
-              const blocks = Array.isArray(payload.message.content) ? payload.message.content : [payload.message.content];
-              for (const b of blocks) {
-                if (typeof b === 'string') replyText += b;
-                else if (b?.text) replyText += b.text;
-              }
-            }
-          }
+          if (!payload) return;
+          logger?.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0,8)}`);
+          if (payload.sessionKey !== sessionKey) return;
 
           if (payload.state === 'final') {
-            // final 包含完整消息
-            if (!replyText && payload.message) {
-              if (typeof payload.message === 'string') {
-                replyText = payload.message;
-              } else if (payload.message?.content) {
-                const blocks = Array.isArray(payload.message.content) ? payload.message.content : [payload.message.content];
-                for (const b of blocks) {
-                  if (typeof b === 'string') replyText += b;
-                  else if (b?.text) replyText += b.text;
-                }
-              }
-            }
+            // final 包含完整回复文本
+            const text = extractContentText(payload.message);
             cleanup();
-            resolve(replyText.trim() || null);
+            resolve(text?.trim() || null);
           }
 
           if (payload.state === 'aborted') {
             cleanup();
-            resolve(replyText.trim() || '⏹ 已中止');
+            resolve('⏹ 已中止');
           }
 
           if (payload.state === 'error') {
             cleanup();
-            resolve(replyText.trim() || `❌ ${payload.errorMessage || '处理出错'}`);
+            resolve(`❌ ${payload.errorMessage || '处理出错'}`);
           }
         });
       });
 
       // 发送消息
-      const result = await gw.request('chat.send', {
+      const sendResult = await gw.request('chat.send', {
         sessionKey,
         message: openclawMessage,
         idempotencyKey: runId
       });
 
-      logger.info(`[OpenClaw] chat.send: runId=${result?.runId} status=${result?.status}`);
+      logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
 
-      // 等待回复
+      // 等待 event 回复
       const reply = await replyPromise;
 
       if (reply) {
@@ -471,7 +451,6 @@ const plugin_onmessage = async (ctx, event) => {
 
     } catch (e) {
       logger.error(`[OpenClaw] 发送失败: ${e.message}`);
-      // gateway 断了，清理并回退到 CLI
       if (gatewayClient) {
         gatewayClient.disconnect();
         gatewayClient = null;
@@ -504,6 +483,46 @@ const plugin_cleanup = async () => {
 };
 
 // ========== 消息提取 ==========
+
+// 从 chat event payload.message 提取文本
+// 格式: { role: "assistant", content: [{ type: "text", text: "..." }] }
+function extractContentText(message) {
+  if (!message) return '';
+  if (typeof message === 'string') return message;
+
+  const content = message.content;
+  if (!content) return '';
+
+  const blocks = Array.isArray(content) ? content : [content];
+  let text = '';
+  for (const b of blocks) {
+    if (typeof b === 'string') text += b;
+    else if (b?.type === 'text' && b?.text) text += b.text;
+    else if (b?.text) text += b.text;
+  }
+  return text;
+}
+
+function extractTextFromPayload(message) {
+  if (typeof message === 'string') return message;
+  if (!message) return '';
+
+  // content block format
+  const content = message.content;
+  if (!content) {
+    // Try direct text field
+    if (typeof message.text === 'string') return message.text;
+    return '';
+  }
+
+  const blocks = Array.isArray(content) ? content : [content];
+  let text = '';
+  for (const b of blocks) {
+    if (typeof b === 'string') text += b;
+    else if (b?.text) text += b.text;
+  }
+  return text;
+}
 
 function extractMessage(segments) {
   const textParts = [];
