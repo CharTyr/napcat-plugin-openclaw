@@ -408,7 +408,42 @@ export const plugin_cleanup = async (): Promise<void> => {
 export const plugin_get_config = async () => currentConfig;
 
 export const plugin_set_config = async (ctx: any, config: any): Promise<void> => {
-  currentConfig = config;
+  // 支持扁平格式的配置（如 'openclaw.token': 'value'）
+  const normalizedConfig: any = {};
+  for (const [key, value] of Object.entries(config)) {
+    if (key.includes('.')) {
+      const parts = key.split('.');
+      let obj = normalizedConfig;
+      for (let i = 0; i < parts.length - 1; i++) {
+        if (!obj[parts[i]]) obj[parts[i]] = {};
+        obj = obj[parts[i]];
+      }
+      obj[parts[parts.length - 1]] = value;
+    } else {
+      normalizedConfig[key] = value;
+    }
+  }
+
+  // 处理白名单：多行文本转数组
+  if (typeof normalizedConfig.behavior?.userWhitelist === 'string') {
+    normalizedConfig.behavior.userWhitelist = normalizedConfig.behavior.userWhitelist
+      .split('\n')
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0)
+      .map((s: string) => Number(s))
+      .filter((n: number) => !isNaN(n));
+  }
+  if (typeof normalizedConfig.behavior?.groupWhitelist === 'string') {
+    normalizedConfig.behavior.groupWhitelist = normalizedConfig.behavior.groupWhitelist
+      .split('\n')
+      .map((s: string) => s.trim())
+      .filter((s: string) => s.length > 0)
+      .map((s: string) => Number(s))
+      .filter((n: number) => !isNaN(n));
+  }
+
+  currentConfig = deepMerge(DEFAULT_CONFIG, normalizedConfig);
+
   if (gatewayClient) {
     gatewayClient.disconnect();
     gatewayClient = null;
@@ -417,7 +452,7 @@ export const plugin_set_config = async (ctx: any, config: any): Promise<void> =>
     try {
       const dir = path.dirname(ctx.configPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(ctx.configPath, JSON.stringify(config, null, 2), 'utf-8');
+      fs.writeFileSync(ctx.configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
     } catch (e: any) {
       logger?.error('[OpenClaw] 保存配置失败: ' + e.message);
     }
