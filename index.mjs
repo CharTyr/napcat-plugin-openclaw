@@ -202,7 +202,25 @@ class ConfigManager {
   }
 
   updateConfig(newConfig) {
-    this.config = { ...this.config, ...newConfig };
+    // 支持扁平格式的配置（如 'openclaw.host': 'value'）
+    for (const [key, value] of Object.entries(newConfig)) {
+      if (key.includes('.')) {
+        const parts = key.split('.');
+        let obj = this.config;
+        for (let i = 0; i < parts.length - 1; i++) {
+          if (!obj[parts[i]]) obj[parts[i]] = {};
+          obj = obj[parts[i]];
+        }
+        obj[parts[parts.length - 1]] = value;
+      } else {
+        // 嵌套对象格式
+        if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+          this.config[key] = { ...this.config[key], ...value };
+        } else {
+          this.config[key] = value;
+        }
+      }
+    }
   }
 
   getOpenClawConfig() {
@@ -215,18 +233,30 @@ class ConfigManager {
   }
 
   getTriggers() {
+    let keywords = this.config.triggers?.keywords || ['莲莲帮我'];
+    // 支持多行文本格式（每行一个关键词）
+    if (typeof keywords === 'string') {
+      keywords = keywords.split('\n').map(k => k.trim()).filter(k => k.length > 0);
+      if (keywords.length === 0) keywords = ['莲莲帮我'];
+    }
     return {
-      keywords: this.config.triggers?.keywords || ['莲莲帮我'],
+      keywords,
       atTrigger: this.config.triggers?.atTrigger || false,
       botUserId: this.config.botUserId
     };
   }
 
   getWhitelist() {
-    return {
-      users: this.config.whitelist?.users || [],
-      groups: this.config.whitelist?.groups || []
-    };
+    let users = this.config.whitelist?.users || [];
+    let groups = this.config.whitelist?.groups || [];
+    // 支持多行文本格式（每行一个 QQ 号）
+    if (typeof users === 'string') {
+      users = users.split('\n').map(u => u.trim()).filter(u => u.length > 0).map(u => Number(u)).filter(u => !isNaN(u));
+    }
+    if (typeof groups === 'string') {
+      groups = groups.split('\n').map(g => g.trim()).filter(g => g.length > 0).map(g => Number(g)).filter(g => !isNaN(g));
+    }
+    return { users, groups };
   }
 
   getLimits() {
@@ -622,56 +652,111 @@ export async function plugin_cleanup() {
   ctx?.log.info('[OpenClaw] Plugin cleaned up');
 }
 
-export const plugin_config_ui = {
-  openclaw: {
-    type: 'object',
-    description: 'OpenClaw 连接配置',
-    properties: {
-      host: { type: 'string', default: '202.47.135.226', description: 'OpenClaw 主机地址' },
-      port: { type: 'number', default: 18789, description: 'OpenClaw 端口' },
-      token: { type: 'string', default: '', description: 'OpenClaw 认证 Token' },
-      user: { type: 'string', default: 'root', description: 'SSH 用户名（用于 SCP 文件传输）' }
-    }
+// NapCat WebUI 配置 Schema（扁平数组格式）
+// 参考: https://napneko.github.io/develop/plugin/start-webui
+export const plugin_config_ui = [
+  // --- OpenClaw 连接配置 ---
+  {
+    key: 'openclaw.host',
+    label: 'OpenClaw 主机地址',
+    type: 'string',
+    default: '202.47.135.226',
+    description: 'OpenClaw Gateway 主机地址',
+    placeholder: '例如: 127.0.0.1 或 example.com'
   },
-  triggers: {
-    type: 'object',
-    description: '触发词配置',
-    properties: {
-      keywords: { 
-        type: 'array', 
-        items: { type: 'string' },
-        default: ['莲莲帮我'],
-        description: '触发关键词列表'
-      },
-      atTrigger: { type: 'boolean', default: false, description: '是否支持 @ 触发' }
-    }
+  {
+    key: 'openclaw.port',
+    label: 'OpenClaw 端口',
+    type: 'number',
+    default: 18789,
+    description: 'OpenClaw Gateway WebSocket 端口'
   },
-  whitelist: {
-    type: 'object',
-    description: '白名单配置（空数组表示允许所有）',
-    properties: {
-      users: { type: 'array', items: { type: 'number' }, default: [], description: '允许的用户 QQ 号' },
-      groups: { type: 'array', items: { type: 'number' }, default: [], description: '允许的群号' }
-    }
+  {
+    key: 'openclaw.token',
+    label: 'OpenClaw 认证 Token',
+    type: 'string',
+    default: '',
+    description: 'OpenClaw Gateway 认证 Token（必填）',
+    placeholder: '在 OpenClaw 配置中获取'
   },
-  limits: {
-    type: 'object',
-    description: '限流配置',
-    properties: {
-      ratePerUserPerHour: { type: 'number', default: 5, description: '每小时每用户请求限制' },
-      maxConcurrent: { type: 'number', default: 3, description: '最大并发任务数' },
-      taskTimeoutSec: { type: 'number', default: 180, description: '任务超时时间（秒）' },
-      cooldownSec: { type: 'number', default: 3, description: '发送消息冷却时间（秒）' }
-    }
+  {
+    key: 'openclaw.user',
+    label: 'SSH 用户名',
+    type: 'string',
+    default: 'root',
+    description: 'SSH 用户名（用于 SCP 文件传输）'
   },
-  filter: {
-    type: 'object',
-    description: '意图过滤配置',
-    properties: {
-      enabled: { type: 'boolean', default: true, description: '是否启用意图过滤' }
-    }
+  // --- 触发词配置 ---
+  {
+    key: 'triggers.keywords',
+    label: '触发关键词',
+    type: 'text',
+    default: '莲莲帮我',
+    description: '触发关键词列表，每行一个关键词',
+    placeholder: '莲莲帮我\n帮我'
+  },
+  {
+    key: 'triggers.atTrigger',
+    label: '启用 @ 触发',
+    type: 'boolean',
+    default: false,
+    description: '群聊中 @bot 是否触发回复'
+  },
+  // --- 白名单配置 ---
+  {
+    key: 'whitelist.users',
+    label: '用户白名单',
+    type: 'text',
+    default: '',
+    description: '允许的用户 QQ 号，每行一个，留空表示允许所有',
+    placeholder: '123456789\n987654321'
+  },
+  {
+    key: 'whitelist.groups',
+    label: '群白名单',
+    type: 'text',
+    default: '',
+    description: '允许的群号，每行一个，留空表示允许所有',
+    placeholder: '123456789\n987654321'
+  },
+  // --- 限流配置 ---
+  {
+    key: 'limits.ratePerUserPerHour',
+    label: '每小时请求限制',
+    type: 'number',
+    default: 5,
+    description: '每用户每小时最大请求次数'
+  },
+  {
+    key: 'limits.maxConcurrent',
+    label: '最大并发任务数',
+    type: 'number',
+    default: 3,
+    description: '同时运行的最大任务数量'
+  },
+  {
+    key: 'limits.taskTimeoutSec',
+    label: '任务超时时间（秒）',
+    type: 'number',
+    default: 180,
+    description: '单个任务的最大执行时间'
+  },
+  {
+    key: 'limits.cooldownSec',
+    label: '消息冷却时间（秒）',
+    type: 'number',
+    default: 3,
+    description: '发送消息之间的最小间隔'
+  },
+  // --- 意图过滤配置 ---
+  {
+    key: 'filter.enabled',
+    label: '启用意图过滤',
+    type: 'boolean',
+    default: true,
+    description: '过滤无效请求（闲聊、恶意请求等）'
   }
-};
+];
 
 // ========== Helper Functions ==========
 
