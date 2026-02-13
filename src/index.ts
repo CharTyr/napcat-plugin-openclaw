@@ -220,7 +220,7 @@ export const plugin_init = async (ctx: any): Promise<void> => {
     logger.warn('[OpenClaw] 加载配置失败: ' + e.message);
   }
 
-  plugin_config_ui = buildConfigSchema();
+  plugin_config_ui = buildConfigSchema(ctx);
 
   // Pre-connect gateway
   try {
