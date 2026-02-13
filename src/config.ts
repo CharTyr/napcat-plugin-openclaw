@@ -64,7 +64,6 @@ export function buildConfigSchema(): any[] {
       type: 'text',
       default: '',
       description: '允许的用户 QQ 号，每行一个，留空表示允许所有',
-      placeholder: '123456789\n987654321',
     },
     {
       key: 'behavior.groupWhitelist',
@@ -72,7 +71,6 @@ export function buildConfigSchema(): any[] {
       type: 'text',
       default: '',
       description: '允许的群号，每行一个，留空表示允许所有',
-      placeholder: '123456789\n987654321',
     },
     {
       key: 'behavior.debounceMs',
