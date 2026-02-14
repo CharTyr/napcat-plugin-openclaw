@@ -202,7 +202,7 @@ async function sendReply(ctx: any, messageType: string, groupId: any, userId: an
 
 // ========== Lifecycle ==========
 
-export let plugin_config_ui: any[] = [];
+export const plugin_config_ui = buildConfigSchema();
 
 export const plugin_init = async (ctx: any): Promise<void> => {
   logger = ctx.logger;
@@ -219,8 +219,6 @@ export const plugin_init = async (ctx: any): Promise<void> => {
   } catch (e: any) {
     logger.warn('[OpenClaw] 加载配置失败: ' + e.message);
   }
-
-  plugin_config_ui = buildConfigSchema();
 
   // Pre-connect gateway
   try {
@@ -405,10 +403,34 @@ export const plugin_cleanup = async (): Promise<void> => {
 
 // ========== Config Hooks ==========
 
-export const plugin_get_config = async () => currentConfig;
+export const plugin_get_config = async () => {
+  return {
+    'openclaw.token': currentConfig.openclaw.token,
+    'openclaw.gatewayUrl': currentConfig.openclaw.gatewayUrl,
+    'openclaw.cliPath': currentConfig.openclaw.cliPath,
+    'behavior.privateChat': currentConfig.behavior.privateChat,
+    'behavior.groupAtOnly': currentConfig.behavior.groupAtOnly,
+    'behavior.userWhitelist': currentConfig.behavior.userWhitelist.join(', '),
+    'behavior.groupWhitelist': currentConfig.behavior.groupWhitelist.join(', '),
+    'behavior.debounceMs': currentConfig.behavior.debounceMs,
+    'behavior.groupSessionMode': currentConfig.behavior.groupSessionMode,
+  };
+};
 
 export const plugin_set_config = async (ctx: any, config: any): Promise<void> => {
-  currentConfig = config;
+  const unflattened = unflattenConfig(config);
+  // Convert comma-separated whitelist strings back to number[]
+  if (unflattened.behavior) {
+    if (typeof unflattened.behavior.userWhitelist === 'string') {
+      unflattened.behavior.userWhitelist = unflattened.behavior.userWhitelist
+        .split(',').map((s: string) => s.trim()).filter(Boolean).map(Number);
+    }
+    if (typeof unflattened.behavior.groupWhitelist === 'string') {
+      unflattened.behavior.groupWhitelist = unflattened.behavior.groupWhitelist
+        .split(',').map((s: string) => s.trim()).filter(Boolean).map(Number);
+    }
+  }
+  currentConfig = deepMerge({ ...DEFAULT_CONFIG }, unflattened);
   if (gatewayClient) {
     gatewayClient.disconnect();
     gatewayClient = null;
@@ -417,7 +439,7 @@ export const plugin_set_config = async (ctx: any, config: any): Promise<void> =>
     try {
       const dir = path.dirname(ctx.configPath);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(ctx.configPath, JSON.stringify(config, null, 2), 'utf-8');
+      fs.writeFileSync(ctx.configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
     } catch (e: any) {
       logger?.error('[OpenClaw] 保存配置失败: ' + e.message);
     }
@@ -434,6 +456,23 @@ function deepMerge(target: any, source: any): any {
     } else {
       result[key] = source[key];
     }
+  }
+  return result;
+}
+
+function unflattenConfig(config: any): any {
+  if (!config || typeof config !== 'object') return config;
+  const hasDotKey = Object.keys(config).some((k) => k.includes('.'));
+  if (!hasDotKey) return config;
+  const result: any = {};
+  for (const [key, value] of Object.entries(config)) {
+    const parts = key.split('.');
+    let cur = result;
+    for (let i = 0; i < parts.length - 1; i++) {
+      if (!cur[parts[i]] || typeof cur[parts[i]] !== 'object') cur[parts[i]] = {};
+      cur = cur[parts[i]];
+    }
+    cur[parts[parts.length - 1]] = value;
   }
   return result;
 }
