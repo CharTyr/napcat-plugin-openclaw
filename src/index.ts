@@ -333,7 +333,8 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
         gw.eventHandlers.set('chat', (payload: any) => {
           if (!payload) return;
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
-          if (payload.sessionKey !== sessionKey) return;
+          // OpenClaw 可能返回带前缀的 sessionKey（如 "agent:main:qq-xxx"），用 contains 匹配
+          if (!payload.sessionKey?.includes(sessionKey)) return;
 
           if (payload.state === 'final') {
             const text = extractContentText(payload.message);

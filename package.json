@@ -21,7 +21,10 @@
       "自动化"
     ],
     "minVersion": "4.14.0",
-    "homepage": ""
+    "homepage": "",
+    "scopes": [
+      "operator.write"
+    ]
   },
   "dependencies": {
     "ws": "^8.16.0"
