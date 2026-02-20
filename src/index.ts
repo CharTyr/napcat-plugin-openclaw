@@ -135,20 +135,34 @@ function extractMessage(segments: any[]): { extractedText: string; extractedMedi
 
 // ========== Text Extraction from Chat Event ==========
 
+function extractTextFromContent(content: any): string {
+  if (typeof content === 'string') return content;
+  if (!content) return '';
+
+  if (Array.isArray(content)) {
+    return content
+      .map((item) => extractTextFromContent(item))
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  if (typeof content !== 'object') return '';
+
+  if (typeof content.text === 'string') return content.text;
+  if (typeof content.output_text === 'string') return content.output_text;
+  if (typeof content.input_text === 'string') return content.input_text;
+  if (content.content) return extractTextFromContent(content.content);
+  return '';
+}
+
 function extractTextFromPayload(message: any): string {
   if (typeof message === 'string') return message;
   if (!message) return '';
 
-  const content = message.content;
-  if (!content) return message.text ?? '';
-
-  const blocks: any[] = Array.isArray(content) ? content : [content];
-  let text = '';
-  for (const b of blocks) {
-    if (typeof b === 'string') text += b;
-    else if (b?.text) text += b.text;
-  }
-  return text;
+  const contentText = extractTextFromContent(message.content);
+  if (contentText.trim()) return contentText;
+  if (typeof message.text === 'string') return message.text;
+  return '';
 }
 
 function extractContentText(message: any): string {
@@ -174,6 +188,61 @@ async function setTypingStatus(ctx: any, userId: number | string, typing: boolea
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+function normalizeMessageTimestampMs(message: any): number | null {
+  if (!message) return null;
+  if (typeof message.timestamp === 'number' && Number.isFinite(message.timestamp)) {
+    return message.timestamp;
+  }
+  if (typeof message.timestamp === 'string') {
+    const parsed = Date.parse(message.timestamp);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
+function pickLatestAssistantText(messages: any[], minTimestampMs: number): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== 'object') continue;
+
+    const role = typeof msg.role === 'string' ? msg.role.toLowerCase() : '';
+    if (role !== 'assistant') continue;
+
+    const text = extractContentText(msg).trim();
+    if (!text) continue;
+
+    const ts = normalizeMessageTimestampMs(msg);
+    if (ts !== null && ts + 1000 < minTimestampMs) continue;
+
+    return text;
+  }
+  return null;
+}
+
+async function resolveReplyFromHistory(
+  gw: GatewayClient,
+  sessionKey: string,
+  minTimestampMs: number
+): Promise<string | null> {
+  const maxAttempts = 6;
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const history = await gw.request('chat.history', { sessionKey, limit: 100 });
+      const messages = Array.isArray(history?.messages) ? history.messages : [];
+      const text = pickLatestAssistantText(messages, minTimestampMs);
+      if (text) return text;
+    } catch (e: any) {
+      logger?.warn(`[OpenClaw] 回查 chat.history 失败: ${e.message}`);
+      return null;
+    }
+
+    if (i + 1 < maxAttempts) {
+      await sleep(350);
+    }
+  }
+  return null;
 }
 
 async function sendReply(ctx: any, messageType: string, groupId: any, userId: any, text: string): Promise<void> {
@@ -315,9 +384,11 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     // Send via Gateway RPC + event listener (non-streaming)
     const sessionKey = getSessionKey(sessionBase);
     const runId = randomUUID();
+    const runStartedAtMs = Date.now();
 
     try {
       const gw = await getGateway();
+      let waitRunId = runId;
 
       // 按 runId 监听 chat 事件，避免多个会话并发时全局 handler 被覆盖
       const replyPromise = new Promise<string | null>((resolve) => {
@@ -328,17 +399,32 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
         const cleanup = () => {
           clearTimeout(timeout);
-          gw.chatWaiters.delete(runId);
+          gw.chatWaiters.delete(waitRunId);
         };
 
-        gw.chatWaiters.set(runId, { handler: (payload: any) => {
+        gw.chatWaiters.set(waitRunId, { handler: (payload: any) => {
           if (!payload) return;
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
 
           if (payload.state === 'final') {
-            const text = extractContentText(payload.message);
             cleanup();
-            resolve(text?.trim() || null);
+            void (async () => {
+              const directText = extractContentText(payload.message).trim();
+              if (directText) {
+                resolve(directText);
+                return;
+              }
+
+              const historySessionKey =
+                typeof payload.sessionKey === 'string' && payload.sessionKey.trim() ? payload.sessionKey : sessionKey;
+              const historyText = await resolveReplyFromHistory(gw, historySessionKey, runStartedAtMs);
+              if (historyText) {
+                logger.info('[OpenClaw] final 帧无文本，已通过 chat.history 回填回复');
+                resolve(historyText);
+                return;
+              }
+              resolve(null);
+            })();
           }
 
           if (payload.state === 'aborted') {
@@ -361,6 +447,18 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       });
 
       logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
+      const actualRunId = typeof sendResult?.runId === 'string' && sendResult.runId ? sendResult.runId : runId;
+      if (actualRunId !== waitRunId) {
+        const waiter = gw.chatWaiters.get(waitRunId);
+        if (waiter) {
+          gw.chatWaiters.delete(waitRunId);
+          waitRunId = actualRunId;
+          gw.chatWaiters.set(waitRunId, waiter);
+        }
+        logger.warn(
+          `[OpenClaw] runId 重映射: local=${runId.slice(0, 8)} server=${actualRunId.slice(0, 8)}`
+        );
+      }
 
       // Wait for final event
       const reply = await replyPromise;
