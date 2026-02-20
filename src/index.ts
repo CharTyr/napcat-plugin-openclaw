@@ -13,7 +13,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
-import { GatewayClient } from './gateway-client';
+import { GatewayClient, createDeviceIdentity } from './gateway-client';
 import { DEFAULT_CONFIG, buildConfigSchema } from './config';
 import type { PluginConfig, ExtractedMedia, ChatEventPayload, ContentBlock } from './types';
 
@@ -85,10 +85,24 @@ function getSessionKey(sessionBase: string): string {
 
 async function getGateway(): Promise<GatewayClient> {
   if (!gatewayClient) {
+    if (!currentConfig.openclaw.deviceIdentity) {
+      currentConfig.openclaw.deviceIdentity = createDeviceIdentity();
+      if (configPath) {
+        try {
+          const dir = path.dirname(configPath);
+          if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+          fs.writeFileSync(configPath, JSON.stringify(currentConfig, null, 2), 'utf-8');
+        } catch (e: any) {
+          logger?.warn(`[OpenClaw] 保存设备身份失败: ${e.message}`);
+        }
+      }
+    }
+
     gatewayClient = new GatewayClient(
       currentConfig.openclaw.gatewayUrl,
       currentConfig.openclaw.token,
-      logger
+      logger,
+      currentConfig.openclaw.deviceIdentity
     );
   }
   if (!gatewayClient.connected) {
@@ -435,6 +449,7 @@ function unflattenConfig(flat: Record<string, any>): PluginConfig {
       token: flat.token ?? '',
       gatewayUrl: flat.gatewayUrl ?? 'ws://127.0.0.1:18789',
       cliPath: flat.cliPath ?? '/root/.nvm/versions/node/v22.22.0/bin/openclaw',
+      deviceIdentity: currentConfig.openclaw?.deviceIdentity,
     },
     behavior: {
       privateChat: flat.privateChat !== false,

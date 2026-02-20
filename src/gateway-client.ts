@@ -1,5 +1,41 @@
 import WebSocket from 'ws';
-import { randomUUID } from 'crypto';
+import crypto, { randomUUID } from 'crypto';
+
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+export interface DeviceIdentity {
+  id: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
+function b64url(buf: Buffer): string {
+  return buf
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function publicKeyRaw(publicKeyPem: string): Buffer {
+  const key = crypto.createPublicKey(publicKeyPem);
+  const spki = key.export({ type: 'spki', format: 'der' }) as Buffer;
+  if (
+    spki.length === ED25519_SPKI_PREFIX.length + 32 &&
+    spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)
+  ) {
+    return spki.subarray(ED25519_SPKI_PREFIX.length);
+  }
+  return spki;
+}
+
+export function createDeviceIdentity(): DeviceIdentity {
+  const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
+  const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const id = crypto.createHash('sha256').update(publicKeyRaw(publicKeyPem)).digest('hex');
+  return { id, publicKeyPem, privateKeyPem };
+}
 
 interface PendingRequest {
   resolve: (value: any) => void;
@@ -25,11 +61,13 @@ export class GatewayClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private lastPong = 0;
   private _destroyed = false;
+  private deviceIdentity: DeviceIdentity;
 
-  constructor(url: string, token: string, logger?: any) {
+  constructor(url: string, token: string, logger?: any, identity?: DeviceIdentity) {
     this.url = url;
     this.token = token;
     this.logger = logger;
+    this.deviceIdentity = identity || createDeviceIdentity();
   }
 
   get connected(): boolean {
@@ -150,20 +188,49 @@ export class GatewayClient {
     timeout: NodeJS.Timeout
   ): void {
     const id = randomUUID();
+    const signedAtMs = Date.now();
+    const nonce = this.connectNonce ?? undefined;
+    const authToken = this.token?.trim() || undefined;
+    const role = 'operator';
+    const scopes = ['operator.admin', 'operator.approvals', 'operator.pairing'];
+    const clientId = 'gateway-client';
+    const clientMode = 'backend';
+    const version = nonce ? 'v2' : 'v1';
+    const signPayload = [
+      version,
+      this.deviceIdentity.id,
+      clientId,
+      clientMode,
+      role,
+      scopes.join(','),
+      String(signedAtMs),
+      authToken ?? '',
+    ];
+    if (version === 'v2') signPayload.push(nonce ?? '');
+    const signKey = crypto.createPrivateKey(this.deviceIdentity.privateKeyPem);
+    const signature = crypto.sign(null, Buffer.from(signPayload.join('|'), 'utf8'), signKey);
+
     const params = {
-      minProtocol: 1,
+      minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: 'gateway-client',
+        id: clientId,
         displayName: 'QQ Channel',
         version: '1.3.0',
         platform: 'linux',
-        mode: 'backend',
+        mode: clientMode,
       },
       caps: [],
-      auth: { token: this.token },
-      role: 'operator',
-      scopes: ['operator.admin'],
+      auth: authToken ? { token: authToken } : undefined,
+      role,
+      scopes,
+      device: {
+        id: this.deviceIdentity.id,
+        publicKey: b64url(publicKeyRaw(this.deviceIdentity.publicKeyPem)),
+        signature: b64url(signature),
+        signedAt: signedAtMs,
+        nonce,
+      },
     };
 
     const frame = { type: 'req', id, method: 'connect', params };

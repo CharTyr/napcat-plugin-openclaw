@@ -3,6 +3,11 @@ export interface PluginConfig {
     token: string;
     gatewayUrl: string;
     cliPath: string;
+    deviceIdentity?: {
+      id: string;
+      publicKeyPem: string;
+      privateKeyPem: string;
+    };
   };
   behavior: {
     privateChat: boolean;
