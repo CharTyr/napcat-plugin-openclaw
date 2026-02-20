@@ -1,5 +1,15 @@
 import WebSocket from 'ws';
-import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomUUID,
+  sign as signWithKey,
+} from 'crypto';
+import { fileURLToPath } from 'url';
 
 interface PendingRequest {
   resolve: (value: any) => void;
@@ -10,9 +20,163 @@ interface ChatWaiter {
   handler: (payload: any) => void;
 }
 
+interface DeviceIdentity {
+  deviceId: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+}
+
+interface StoredDeviceIdentity {
+  version: 1;
+  deviceId: string;
+  publicKeyPem: string;
+  privateKeyPem: string;
+  createdAtMs: number;
+}
+
+interface DeviceAuthPayloadParams {
+  deviceId: string;
+  clientId: string;
+  clientMode: string;
+  role: string;
+  scopes: string[];
+  signedAtMs: number;
+  token?: string | null;
+  nonce?: string | null;
+}
+
+const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+function ensureDir(filePath: string): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+}
+
+function base64UrlEncode(buf: Buffer): string {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function derivePublicKeyRaw(publicKeyPem: string): Buffer {
+  const key = createPublicKey(publicKeyPem);
+  const spki = key.export({ type: 'spki', format: 'der' }) as Buffer;
+  if (
+    spki.length === ED25519_SPKI_PREFIX.length + 32 &&
+    spki.subarray(0, ED25519_SPKI_PREFIX.length).equals(ED25519_SPKI_PREFIX)
+  ) {
+    return spki.subarray(ED25519_SPKI_PREFIX.length);
+  }
+  return spki;
+}
+
+function fingerprintPublicKey(publicKeyPem: string): string {
+  return createHash('sha256').update(derivePublicKeyRaw(publicKeyPem)).digest('hex');
+}
+
+function publicKeyRawBase64UrlFromPem(publicKeyPem: string): string {
+  return base64UrlEncode(derivePublicKeyRaw(publicKeyPem));
+}
+
+function buildDeviceAuthPayload(params: DeviceAuthPayloadParams): string {
+  const version = params.nonce ? 'v2' : 'v1';
+  const scopes = params.scopes.join(',');
+  const token = params.token ?? '';
+  const base = [
+    version,
+    params.deviceId,
+    params.clientId,
+    params.clientMode,
+    params.role,
+    scopes,
+    String(params.signedAtMs),
+    token,
+  ];
+  if (version === 'v2') {
+    base.push(params.nonce ?? '');
+  }
+  return base.join('|');
+}
+
+function signDevicePayload(privateKeyPem: string, payload: string): string {
+  const key = createPrivateKey(privateKeyPem);
+  const signature = signWithKey(null, Buffer.from(payload, 'utf8'), key);
+  return base64UrlEncode(signature);
+}
+
+function resolveDeviceIdentityPath(): string {
+  const envPath = process.env.OPENCLAW_DEVICE_IDENTITY_PATH?.trim();
+  if (envPath) return envPath;
+  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+  return path.join(moduleDir, '.openclaw-device.json');
+}
+
+function loadOrCreateDeviceIdentity(filePath: string): DeviceIdentity {
+  try {
+    if (fs.existsSync(filePath)) {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      const parsed = JSON.parse(raw) as StoredDeviceIdentity;
+      if (
+        parsed?.version === 1 &&
+        typeof parsed.deviceId === 'string' &&
+        typeof parsed.publicKeyPem === 'string' &&
+        typeof parsed.privateKeyPem === 'string'
+      ) {
+        const derivedId = fingerprintPublicKey(parsed.publicKeyPem);
+        if (derivedId !== parsed.deviceId) {
+          const updated: StoredDeviceIdentity = { ...parsed, deviceId: derivedId };
+          fs.writeFileSync(filePath, `${JSON.stringify(updated, null, 2)}\n`, { mode: 0o600 });
+          try {
+            fs.chmodSync(filePath, 0o600);
+          } catch {
+            // 最佳努力权限收敛
+          }
+          return {
+            deviceId: derivedId,
+            publicKeyPem: parsed.publicKeyPem,
+            privateKeyPem: parsed.privateKeyPem,
+          };
+        }
+        return {
+          deviceId: parsed.deviceId,
+          publicKeyPem: parsed.publicKeyPem,
+          privateKeyPem: parsed.privateKeyPem,
+        };
+      }
+    }
+  } catch {
+    // 文件损坏时自动重建
+  }
+
+  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+  const publicKeyPem = publicKey.export({ type: 'spki', format: 'pem' }).toString();
+  const privateKeyPem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const identity: DeviceIdentity = {
+    deviceId: fingerprintPublicKey(publicKeyPem),
+    publicKeyPem,
+    privateKeyPem,
+  };
+
+  ensureDir(filePath);
+  const stored: StoredDeviceIdentity = {
+    version: 1,
+    deviceId: identity.deviceId,
+    publicKeyPem: identity.publicKeyPem,
+    privateKeyPem: identity.privateKeyPem,
+    createdAtMs: Date.now(),
+  };
+  fs.writeFileSync(filePath, `${JSON.stringify(stored, null, 2)}\n`, { mode: 0o600 });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    // 最佳努力权限收敛
+  }
+
+  return identity;
+}
+
 export class GatewayClient {
   private url: string;
   private token: string;
+  private deviceIdentityPath: string;
+  private deviceIdentity: DeviceIdentity | null = null;
   private ws: WebSocket | null = null;
   private pending = new Map<string, PendingRequest>();
   public eventHandlers = new Map<string, (payload: any) => void>();
@@ -30,6 +194,17 @@ export class GatewayClient {
     this.url = url;
     this.token = token;
     this.logger = logger;
+    this.deviceIdentityPath = resolveDeviceIdentityPath();
+
+    try {
+      this.deviceIdentity = loadOrCreateDeviceIdentity(this.deviceIdentityPath);
+      this.logger?.info(
+        `[OpenClaw] 设备身份已就绪: ${this.deviceIdentity.deviceId.slice(0, 8)}... (${this.deviceIdentityPath})`
+      );
+    } catch (e: any) {
+      this.deviceIdentity = null;
+      this.logger?.warn(`[OpenClaw] 设备身份初始化失败，将退化为无 device 握手: ${e?.message || e}`);
+    }
   }
 
   get connected(): boolean {
@@ -150,6 +325,32 @@ export class GatewayClient {
     timeout: NodeJS.Timeout
   ): void {
     const id = randomUUID();
+    const role = 'operator';
+    const scopes = ['operator.admin', 'operator.write'];
+    const signedAtMs = Date.now();
+    const nonce = this.connectNonce ?? undefined;
+    const device = this.deviceIdentity
+      ? (() => {
+          const payload = buildDeviceAuthPayload({
+            deviceId: this.deviceIdentity!.deviceId,
+            clientId: 'gateway-client',
+            clientMode: 'backend',
+            role,
+            scopes,
+            signedAtMs,
+            token: this.token || null,
+            nonce,
+          });
+          return {
+            id: this.deviceIdentity!.deviceId,
+            publicKey: publicKeyRawBase64UrlFromPem(this.deviceIdentity!.publicKeyPem),
+            signature: signDevicePayload(this.deviceIdentity!.privateKeyPem, payload),
+            signedAt: signedAtMs,
+            nonce,
+          };
+        })()
+      : undefined;
+
     const params = {
       minProtocol: 1,
       maxProtocol: 3,
@@ -162,8 +363,10 @@ export class GatewayClient {
       },
       caps: [],
       auth: { token: this.token },
-      role: 'operator',
-      scopes: ['operator.admin'],
+      role,
+      // chat.send 需要 operator.write，仅申请 admin 会在网关侧被拒绝
+      scopes,
+      device,
     };
 
     const frame = { type: 'req', id, method: 'connect', params };
