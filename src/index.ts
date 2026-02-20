@@ -319,7 +319,7 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     try {
       const gw = await getGateway();
 
-      // Listen for chat events — only use final (contains full text)
+      // 按 runId 监听 chat 事件，避免多个会话并发时全局 handler 被覆盖
       const replyPromise = new Promise<string | null>((resolve) => {
         const timeout = setTimeout(() => {
           cleanup();
@@ -328,14 +328,12 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
         const cleanup = () => {
           clearTimeout(timeout);
-          gw.eventHandlers.delete('chat');
+          gw.chatWaiters.delete(runId);
         };
 
-        gw.eventHandlers.set('chat', (payload: any) => {
+        gw.chatWaiters.set(runId, { handler: (payload: any) => {
           if (!payload) return;
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
-          // OpenClaw 可能返回带前缀的 sessionKey（如 "agent:main:qq-xxx"），用 contains 匹配
-          if (!payload.sessionKey?.includes(sessionKey)) return;
 
           if (payload.state === 'final') {
             const text = extractContentText(payload.message);
@@ -352,7 +350,7 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
             cleanup();
             resolve(`❌ ${payload.errorMessage || '处理出错'}`);
           }
-        });
+        }});
       });
 
       // Send message
@@ -370,7 +368,8 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       if (reply) {
         await sendReply(ctx, messageType, groupId, userId, reply);
       } else {
-        logger.info('[OpenClaw] 无回复内容');
+        logger.warn('[OpenClaw] 无回复内容，返回兜底提示');
+        await sendReply(ctx, messageType, groupId, userId, '⚠️ 模型未返回内容，请稍后重试。');
       }
     } catch (e: any) {
       logger.error(`[OpenClaw] 发送失败: ${e.message}`);
