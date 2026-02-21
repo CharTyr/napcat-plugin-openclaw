@@ -224,10 +224,17 @@ function pickLatestAssistantText(messages: any[], minTimestampMs: number): strin
 async function resolveReplyFromHistory(
   gw: GatewayClient,
   sessionKey: string,
-  minTimestampMs: number
+  minTimestampMs: number,
+  options?: {
+    maxAttempts?: number;
+    intervalMs?: number;
+    shouldStop?: () => boolean;
+  }
 ): Promise<string | null> {
-  const maxAttempts = 6;
+  const maxAttempts = Math.max(1, options?.maxAttempts ?? 6);
+  const intervalMs = Math.max(100, options?.intervalMs ?? 350);
   for (let i = 0; i < maxAttempts; i++) {
+    if (options?.shouldStop?.()) return null;
     try {
       const history = await gw.request('chat.history', { sessionKey, limit: 100 });
       const messages = Array.isArray(history?.messages) ? history.messages : [];
@@ -239,10 +246,16 @@ async function resolveReplyFromHistory(
     }
 
     if (i + 1 < maxAttempts) {
-      await sleep(350);
+      await sleep(intervalMs);
     }
   }
   return null;
+}
+
+function isRecoverableGatewayError(errorMessage: string): boolean {
+  const normalized = errorMessage.trim().toLowerCase();
+  if (!normalized) return false;
+  return /(terminated|abort|cancel|killed|interrupt|retry|timeout|in[_ -]?flight)/i.test(normalized);
 }
 
 async function sendReply(ctx: any, messageType: string, groupId: any, userId: any, text: string): Promise<void> {
@@ -392,9 +405,46 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
       // 按 runId 监听 chat 事件，避免多个会话并发时全局 handler 被覆盖
       const replyPromise = new Promise<string | null>((resolve) => {
-        const timeout = setTimeout(() => {
+        let settled = false;
+        let recovering = false;
+        let latestSessionKey = sessionKey;
+
+        const safeResolve = (value: string | null) => {
+          if (settled) return;
+          settled = true;
           cleanup();
-          resolve(null);
+          resolve(value);
+        };
+
+        const recoverFromHistory = async (
+          reason: string,
+          fallback: string | null,
+          maxAttempts = 40,
+          intervalMs = 500
+        ) => {
+          if (settled || recovering) return;
+          recovering = true;
+          try {
+            const historyText = await resolveReplyFromHistory(gw, latestSessionKey, runStartedAtMs, {
+              maxAttempts,
+              intervalMs,
+              shouldStop: () => settled,
+            });
+            if (settled) return;
+            if (historyText) {
+              logger.info(`[OpenClaw] ${reason}，已通过 chat.history 回填回复`);
+              safeResolve(historyText);
+              return;
+            }
+            safeResolve(fallback);
+          } finally {
+            recovering = false;
+          }
+        };
+
+        const timeout = setTimeout(() => {
+          logger.warn('[OpenClaw] 等待 final 超时，尝试通过 chat.history 补拉回复');
+          void recoverFromHistory('等待 final 超时', null, 12, 500);
         }, 180000);
 
         const cleanup = () => {
@@ -403,38 +453,48 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
         };
 
         gw.chatWaiters.set(waitRunId, { handler: (payload: any) => {
+          if (settled) return;
           if (!payload) return;
+          if (typeof payload.sessionKey === 'string' && payload.sessionKey.trim()) {
+            latestSessionKey = payload.sessionKey.trim();
+          }
           logger.info(`[OpenClaw] chat event: state=${payload.state} session=${payload.sessionKey} run=${payload.runId?.slice(0, 8)}`);
 
           if (payload.state === 'final') {
-            cleanup();
-            void (async () => {
-              const directText = extractContentText(payload.message).trim();
-              if (directText) {
-                resolve(directText);
-                return;
-              }
-
-              const historySessionKey =
-                typeof payload.sessionKey === 'string' && payload.sessionKey.trim() ? payload.sessionKey : sessionKey;
-              const historyText = await resolveReplyFromHistory(gw, historySessionKey, runStartedAtMs);
-              if (historyText) {
-                logger.info('[OpenClaw] final 帧无文本，已通过 chat.history 回填回复');
-                resolve(historyText);
-                return;
-              }
-              resolve(null);
-            })();
+            const directText = extractContentText(payload.message).trim();
+            if (directText) {
+              safeResolve(directText);
+              return;
+            }
+            void recoverFromHistory('final 帧无文本', null, 20, 400);
+            return;
           }
 
           if (payload.state === 'aborted') {
-            cleanup();
-            resolve('⏹ 已中止');
+            logger.warn('[OpenClaw] 收到 aborted 事件，等待后续重试结果');
+            void recoverFromHistory(
+              '收到 aborted 事件',
+              '⚠️ 本次运行被中断，未拿到最终回复，请稍后重试。',
+              45,
+              500
+            );
+            return;
           }
 
           if (payload.state === 'error') {
-            cleanup();
-            resolve(`❌ ${payload.errorMessage || '处理出错'}`);
+            const errorMessage = String(payload.errorMessage || '处理出错');
+            if (isRecoverableGatewayError(errorMessage)) {
+              logger.warn(`[OpenClaw] 收到可恢复错误: ${errorMessage}，等待后续重试结果`);
+              void recoverFromHistory(
+                `收到 error(${errorMessage})`,
+                '⚠️ 本次运行被中断，未拿到最终回复，请稍后重试。',
+                45,
+                500
+              );
+            } else {
+              safeResolve(`❌ ${errorMessage}`);
+            }
+            return;
           }
         }});
       });
