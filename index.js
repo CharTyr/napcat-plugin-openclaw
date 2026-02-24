@@ -19,12 +19,12 @@ let configPath = null;
 let botUserId = null;
 
 const sessionEpochs = new Map();
-const activeTasks = new Map(); // sessionBase -> { abortController, runId }
 
 let currentConfig = {
   openclaw: {
-    token: '6696ec274e281ab8dcb13d6c597f46eaac874c4cc3329b66ac56da7ddca52550',
-    gatewayUrl: 'ws://127.0.0.1:18789'
+    token: '',
+    gatewayUrl: 'ws://127.0.0.1:18789',
+    cliPath: '/root/.nvm/versions/node/v22.22.0/bin/openclaw'
   },
   behavior: {
     privateChat: true,
@@ -487,6 +487,7 @@ const plugin_init = async (ctx) => {
 };
 
 const plugin_onmessage = async (ctx, event) => {
+  let typingStatusOn = false;
   try {
     if (!logger) return;
     lastCtx = ctx; // 保存用于主动推送
@@ -535,7 +536,7 @@ const plugin_onmessage = async (ctx, event) => {
 
     // Debug: 记录未识别的消息段
     if (!text && extractedMedia.length === 0) {
-      const rawSegs = (event.message || []).map(s => `${s.type}:${JSON.stringify(s.data).slice(0,120)}`);
+      const rawSegs = (event.message || []).map(s => `${s.type}:${JSON.stringify(s.data).slice(0,50)}`);
       if (rawSegs.length > 0) logger?.info(`[OpenClaw] 未提取到内容，原始段: ${rawSegs.join(' | ')}`);
       return;
     }
@@ -599,11 +600,12 @@ const plugin_onmessage = async (ctx, event) => {
       }
     }
 
-    logger.info(`[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 80)}`);
+    logger.info(`[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 50)}`);
 
     // 设置输入状态
     if (messageType === 'private') {
-      setTypingStatus(ctx, userId, true);
+      typingStatusOn = true;
+      await setTypingStatus(ctx, userId, true);
     }
 
     // ====== 通过 Gateway RPC chat.send + event 监听 ======
@@ -688,8 +690,9 @@ const plugin_onmessage = async (ctx, event) => {
       }
       try {
         const escapedMessage = openclawMessage.replace(/'/g, "'\\''");
+        const cliPath = currentConfig.openclaw.cliPath || '/root/.nvm/versions/node/v22.22.0/bin/openclaw';
         const { stdout } = await execAsync(
-          `OPENCLAW_TOKEN='${currentConfig.openclaw.token}' /root/.nvm/versions/node/v22.22.0/bin/openclaw agent --session-id '${sessionKey}' --message '${escapedMessage}' 2>&1`,
+          `OPENCLAW_TOKEN='${currentConfig.openclaw.token}' ${cliPath} agent --session-id '${sessionKey}' --message '${escapedMessage}' 2>&1`,
           { timeout: 180000, maxBuffer: 1024 * 1024 }
         );
         if (stdout.trim()) {
@@ -702,6 +705,10 @@ const plugin_onmessage = async (ctx, event) => {
 
   } catch (outerErr) {
     logger?.error(`[OpenClaw] 未捕获异常: ${outerErr.message}\n${outerErr.stack}`);
+  } finally {
+    if (typingStatusOn) {
+      await setTypingStatus(ctx, event?.user_id, false);
+    }
   }
 };
 
@@ -916,13 +923,18 @@ function sleep(ms) {
 }
 
 // 下载 URL 到 Buffer（5MB 限制，10 秒超时）
-function downloadToBuffer(url, maxBytes = 5 * 1024 * 1024) {
+function downloadToBuffer(url, maxBytes = 5 * 1024 * 1024, redirectCount = 0) {
   return new Promise((resolve, reject) => {
     const mod = url.startsWith('https') ? https : http;
     const req = mod.get(url, { timeout: 10000 }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        if (redirectCount >= 5) {
+          res.resume();
+          reject(new Error('too many redirects'));
+          return;
+        }
         // Follow redirect
-        downloadToBuffer(res.headers.location, maxBytes).then(resolve, reject);
+        downloadToBuffer(res.headers.location, maxBytes, redirectCount + 1).then(resolve, reject);
         res.resume();
         return;
       }
@@ -962,7 +974,7 @@ let pluginDir = null;
 
 async function saveMediaToCache(mediaList, ctx) {
   const cacheDir = path.join(pluginDir || '/tmp', 'cache', 'media');
-  if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
+  await fs.promises.mkdir(cacheDir, { recursive: true });
 
   const saved = [];
   for (const m of mediaList) {
@@ -979,12 +991,15 @@ async function saveMediaToCache(mediaList, ctx) {
           }, ctx.adapterName, ctx.pluginManager?.config);
           if (fileInfo?.file) {
             // file 可能是本地路径
-            if (fs.existsSync(fileInfo.file)) {
-              buf = fs.readFileSync(fileInfo.file);
-            } else if (fileInfo.url) {
-              buf = await downloadToBuffer(fileInfo.url, 10 * 1024 * 1024);
-            } else if (fileInfo.base64) {
-              buf = Buffer.from(fileInfo.base64, 'base64');
+            try {
+              await fs.promises.access(fileInfo.file);
+              buf = await fs.promises.readFile(fileInfo.file);
+            } catch {
+              if (fileInfo.url) {
+                buf = await downloadToBuffer(fileInfo.url, 10 * 1024 * 1024);
+              } else if (fileInfo.base64) {
+                buf = Buffer.from(fileInfo.base64, 'base64');
+              }
             }
           }
         } catch (e) {
@@ -1008,7 +1023,7 @@ async function saveMediaToCache(mediaList, ctx) {
       }
       const filename = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
       const filepath = path.join(cacheDir, filename);
-      fs.writeFileSync(filepath, buf);
+      await fs.promises.writeFile(filepath, buf);
       saved.push({ type: m.type, path: filepath, name: m.name || filename, size: buf.length });
       logger?.info(`[OpenClaw] 文件已保存: ${filepath} (${(buf.length/1024).toFixed(0)}KB)`);
     } catch (e) {
@@ -1021,10 +1036,10 @@ async function saveMediaToCache(mediaList, ctx) {
   // 清理 1 小时前的旧文件
   try {
     const cutoff = Date.now() - 3600000;
-    for (const f of fs.readdirSync(cacheDir)) {
+    for (const f of await fs.promises.readdir(cacheDir)) {
       const fp = path.join(cacheDir, f);
-      const stat = fs.statSync(fp);
-      if (stat.mtimeMs < cutoff) fs.unlinkSync(fp);
+      const stat = await fs.promises.stat(fp);
+      if (stat.mtimeMs < cutoff) await fs.promises.unlink(fp);
     }
   } catch (_) {}
 
@@ -1072,39 +1087,60 @@ function deepMerge(target, source) {
 
 let plugin_config_ui = [];
 const plugin_get_config = async () => {
-  // 脱敏 token
-  const config = JSON.parse(JSON.stringify(currentConfig));
-  if (config.openclaw?.token) {
-    const t = config.openclaw.token;
-    config.openclaw.token = t.length > 8 ? t.slice(0, 4) + '****' + t.slice(-4) : '****';
-  }
-  return config;
+  const behavior = currentConfig.behavior || {};
+  const token = currentConfig.openclaw?.token || '';
+  return {
+    token: token ? (token.length > 8 ? token.slice(0, 4) + '****' + token.slice(-4) : '****') : '',
+    gatewayUrl: currentConfig.openclaw?.gatewayUrl || 'ws://127.0.0.1:18789',
+    cliPath: currentConfig.openclaw?.cliPath || '/root/.nvm/versions/node/v22.22.0/bin/openclaw',
+    privateChat: behavior.privateChat !== false,
+    groupAtOnly: behavior.groupAtOnly !== false,
+    userWhitelist: (behavior.userWhitelist || []).join(','),
+    groupWhitelist: (behavior.groupWhitelist || []).join(','),
+    debounceMs: Number(behavior.debounceMs) || 2000,
+    groupSessionMode: behavior.groupSessionMode === 'shared' ? 'shared' : 'user'
+  };
 };
 const plugin_set_config = async (ctx, config) => {
-  // WebUI 传来的是扁平 key-value，需要转换
-  if (config['openclaw.token'] !== undefined || config['behavior.privateChat'] !== undefined) {
-    // 扁平格式，映射回嵌套结构
-    if (config['openclaw.token'] !== undefined) {
-      const t = config['openclaw.token'];
-      if (!t.includes('****')) currentConfig.openclaw.token = t;
-    }
-    if (config['openclaw.gatewayUrl'] !== undefined) currentConfig.openclaw.gatewayUrl = config['openclaw.gatewayUrl'];
-    if (config['behavior.privateChat'] !== undefined) currentConfig.behavior.privateChat = config['behavior.privateChat'];
-    if (config['behavior.groupAtOnly'] !== undefined) currentConfig.behavior.groupAtOnly = config['behavior.groupAtOnly'];
-    if (config['behavior.userWhitelist'] !== undefined) {
-      const v = config['behavior.userWhitelist'];
-      currentConfig.behavior.userWhitelist = typeof v === 'string' ? v.split(',').map(Number).filter(Boolean) : (Array.isArray(v) ? v : []);
-    }
-    if (config['behavior.groupWhitelist'] !== undefined) {
-      const v = config['behavior.groupWhitelist'];
-      currentConfig.behavior.groupWhitelist = typeof v === 'string' ? v.split(',').map(Number).filter(Boolean) : (Array.isArray(v) ? v : []);
-    }
-    if (config['behavior.debounceMs'] !== undefined) {
-      currentConfig.behavior.debounceMs = parseInt(config['behavior.debounceMs']) || 2000;
-    }
-    if (config['behavior.groupSessionMode'] !== undefined) {
-      currentConfig.behavior.groupSessionMode = config['behavior.groupSessionMode'];
-    }
+  const parseNumList = (v) => {
+    if (typeof v === 'string') return v.split(',').map(Number).filter(Boolean);
+    if (Array.isArray(v)) return v.map(Number).filter(Boolean);
+    return [];
+  };
+  const get = (plainKey, dottedKey) => {
+    if (config[plainKey] !== undefined) return config[plainKey];
+    return config[dottedKey];
+  };
+  const maybeToken = get('token', 'openclaw.token');
+  const maybeGatewayUrl = get('gatewayUrl', 'openclaw.gatewayUrl');
+  const maybeCliPath = get('cliPath', 'openclaw.cliPath');
+  const maybePrivateChat = get('privateChat', 'behavior.privateChat');
+  const maybeGroupAtOnly = get('groupAtOnly', 'behavior.groupAtOnly');
+  const maybeUserWhitelist = get('userWhitelist', 'behavior.userWhitelist');
+  const maybeGroupWhitelist = get('groupWhitelist', 'behavior.groupWhitelist');
+  const maybeDebounceMs = get('debounceMs', 'behavior.debounceMs');
+  const maybeGroupSessionMode = get('groupSessionMode', 'behavior.groupSessionMode');
+
+  if (
+    maybeToken !== undefined ||
+    maybeGatewayUrl !== undefined ||
+    maybeCliPath !== undefined ||
+    maybePrivateChat !== undefined ||
+    maybeGroupAtOnly !== undefined ||
+    maybeUserWhitelist !== undefined ||
+    maybeGroupWhitelist !== undefined ||
+    maybeDebounceMs !== undefined ||
+    maybeGroupSessionMode !== undefined
+  ) {
+    if (typeof maybeToken === 'string' && !maybeToken.includes('****')) currentConfig.openclaw.token = maybeToken;
+    if (maybeGatewayUrl !== undefined) currentConfig.openclaw.gatewayUrl = maybeGatewayUrl;
+    if (maybeCliPath !== undefined) currentConfig.openclaw.cliPath = maybeCliPath;
+    if (maybePrivateChat !== undefined) currentConfig.behavior.privateChat = maybePrivateChat !== false;
+    if (maybeGroupAtOnly !== undefined) currentConfig.behavior.groupAtOnly = maybeGroupAtOnly !== false;
+    if (maybeUserWhitelist !== undefined) currentConfig.behavior.userWhitelist = parseNumList(maybeUserWhitelist);
+    if (maybeGroupWhitelist !== undefined) currentConfig.behavior.groupWhitelist = parseNumList(maybeGroupWhitelist);
+    if (maybeDebounceMs !== undefined) currentConfig.behavior.debounceMs = parseInt(maybeDebounceMs, 10) || 2000;
+    if (maybeGroupSessionMode !== undefined) currentConfig.behavior.groupSessionMode = maybeGroupSessionMode === 'shared' ? 'shared' : 'user';
   } else {
     // 已经是嵌套格式
     currentConfig = deepMerge(currentConfig, config);

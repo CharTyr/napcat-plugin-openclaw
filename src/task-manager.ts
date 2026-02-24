@@ -1,4 +1,5 @@
 // 任务管理器 - 管理任务状态、限流、并发控制
+import { randomUUID } from 'crypto';
 
 export enum TaskState {
   PENDING = 'pending',
@@ -52,7 +53,7 @@ export class TaskManager {
   }
 
   private generateTaskId(): string {
-    return Math.random().toString(36).substring(2, 10);
+    return randomUUID().replace(/-/g, '').slice(0, 8);
   }
 
   private checkRateLimit(userId: number): boolean {
