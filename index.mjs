@@ -1,5 +1,5 @@
 // NapCat Plugin Entry Point
-// 编译后的 ESM 版本
+// ⚠️ Legacy file: this file is kept for compatibility; index.js is the canonical source of truth.
 
 // ========== OpenClaw WebSocket Client ==========
 import WebSocket from 'ws';
@@ -437,12 +437,12 @@ class TaskManager {
 
 // ========== File Fetcher ==========
 
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const MARKER_FILE = '/tmp/.seren_task_marker';
 const LOCAL_FILE_DIR = '/tmp/napcat-openclaw-files';
@@ -458,10 +458,33 @@ class FileFetcher {
     }
   }
 
+  getHostTarget() {
+    if (!/^[a-zA-Z0-9._-]+$/.test(this.user) || !/^[a-zA-Z0-9._:-]+$/.test(this.host)) {
+      throw new Error('invalid ssh target');
+    }
+    return `${this.user}@${this.host}`;
+  }
+
+  validateRemotePath(remotePath) {
+    const normalized = String(remotePath || '').trim();
+    if (!normalized.startsWith(`${REMOTE_OUTPUT_DIR}/`)) {
+      throw new Error(`remote path out of allowed dir: ${normalized}`);
+    }
+    if (/[\r\n\0]/.test(normalized)) {
+      throw new Error('remote path contains invalid characters');
+    }
+    return normalized;
+  }
+
   async createMarker() {
     try {
-      const cmd = `ssh -o ConnectTimeout=5 -o StrictHostKeyChecking=no ${this.user}@${this.host} "touch ${MARKER_FILE}"`;
-      await execAsync(cmd);
+      await execFileAsync('ssh', [
+        '-o', 'ConnectTimeout=5',
+        '-o', 'StrictHostKeyChecking=no',
+        this.getHostTarget(),
+        'touch',
+        MARKER_FILE
+      ]);
     } catch (e) {
       // 静默失败
     }
@@ -471,9 +494,17 @@ class FileFetcher {
     const localFiles = [];
 
     try {
-      const findCmd = `ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${this.user}@${this.host} "find ${REMOTE_OUTPUT_DIR} -type f -newer ${MARKER_FILE} 2>/dev/null"`;
-      
-      const { stdout } = await execAsync(findCmd, { timeout: 30000 });
+      const { stdout } = await execFileAsync('ssh', [
+        '-o', 'ConnectTimeout=10',
+        '-o', 'StrictHostKeyChecking=no',
+        this.getHostTarget(),
+        'find',
+        REMOTE_OUTPUT_DIR,
+        '-type',
+        'f',
+        '-newer',
+        MARKER_FILE
+      ], { timeout: 30000 });
       const remoteFiles = stdout.trim().split('\n').filter(f => f.length > 0);
 
       if (remoteFiles.length === 0) {
@@ -486,12 +517,17 @@ class FileFetcher {
       }
 
       for (const remotePath of remoteFiles) {
-        const fileName = path.basename(remotePath);
+        const safeRemotePath = this.validateRemotePath(remotePath);
+        const fileName = path.basename(safeRemotePath);
         const localPath = path.join(taskDir, fileName);
 
         try {
-          const scpCmd = `scp -o ConnectTimeout=10 -o StrictHostKeyChecking=no ${this.user}@${this.host}:"${remotePath}" "${localPath}"`;
-          await execAsync(scpCmd, { timeout: 60000 });
+          await execFileAsync('scp', [
+            '-o', 'ConnectTimeout=10',
+            '-o', 'StrictHostKeyChecking=no',
+            `${this.getHostTarget()}:${safeRemotePath}`,
+            localPath
+          ], { timeout: 60000 });
 
           if (fs.existsSync(localPath)) {
             localFiles.push(localPath);

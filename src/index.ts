@@ -318,6 +318,7 @@ export const plugin_init = async (ctx: any): Promise<void> => {
 };
 
 export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
+  let typingStatusOn = false;
   try {
     if (!logger) return;
     if (event.post_type !== 'message') return;
@@ -389,10 +390,13 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     }
 
     logger.info(
-      `[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 80)}`
+      `[OpenClaw] ${messageType === 'private' ? '私聊' : `群${groupId}`} ${nickname}(${userId}): ${openclawMessage.slice(0, 50)}`
     );
 
-    if (messageType === 'private') setTypingStatus(ctx, userId, true);
+    if (messageType === 'private') {
+      typingStatusOn = true;
+      await setTypingStatus(ctx, userId, true);
+    }
 
     // Send via Gateway RPC + event listener (non-streaming)
     const sessionKey = getSessionKey(sessionBase);
@@ -551,6 +555,10 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     }
   } catch (outerErr: any) {
     logger?.error(`[OpenClaw] 未捕获异常: ${outerErr.message}\n${outerErr.stack}`);
+  } finally {
+    if (typingStatusOn) {
+      await setTypingStatus(ctx, event?.user_id, false);
+    }
   }
 };
 
@@ -604,10 +612,59 @@ function unflattenConfig(flat: Record<string, any>): PluginConfig {
   };
 }
 
-export const plugin_get_config = async () => flattenConfig(currentConfig);
+export const plugin_get_config = async () => {
+  const flat = flattenConfig(currentConfig);
+  if (flat.token) {
+    const t = String(flat.token);
+    flat.token = t.length > 8 ? `${t.slice(0, 4)}****${t.slice(-4)}` : '****';
+  }
+  return flat;
+};
 
 export const plugin_set_config = async (ctx: any, config: any): Promise<void> => {
-  currentConfig = unflattenConfig(config);
+  const get = (plainKey: string, dottedKey: string): any => {
+    if (config?.[plainKey] !== undefined) return config[plainKey];
+    return config?.[dottedKey];
+  };
+
+  const maybeToken = get('token', 'openclaw.token');
+  const maybeGatewayUrl = get('gatewayUrl', 'openclaw.gatewayUrl');
+  const maybeCliPath = get('cliPath', 'openclaw.cliPath');
+  const maybePrivateChat = get('privateChat', 'behavior.privateChat');
+  const maybeGroupAtOnly = get('groupAtOnly', 'behavior.groupAtOnly');
+  const maybeUserWhitelist = get('userWhitelist', 'behavior.userWhitelist');
+  const maybeGroupWhitelist = get('groupWhitelist', 'behavior.groupWhitelist');
+  const maybeDebounceMs = get('debounceMs', 'behavior.debounceMs');
+  const maybeGroupSessionMode = get('groupSessionMode', 'behavior.groupSessionMode');
+
+  if (
+    maybeToken !== undefined ||
+    maybeGatewayUrl !== undefined ||
+    maybeCliPath !== undefined ||
+    maybePrivateChat !== undefined ||
+    maybeGroupAtOnly !== undefined ||
+    maybeUserWhitelist !== undefined ||
+    maybeGroupWhitelist !== undefined ||
+    maybeDebounceMs !== undefined ||
+    maybeGroupSessionMode !== undefined
+  ) {
+    const flatConfig = {
+      token: typeof maybeToken === 'string' && maybeToken.includes('****')
+        ? currentConfig.openclaw.token
+        : (maybeToken ?? currentConfig.openclaw.token),
+      gatewayUrl: maybeGatewayUrl ?? currentConfig.openclaw.gatewayUrl,
+      cliPath: maybeCliPath ?? currentConfig.openclaw.cliPath,
+      privateChat: maybePrivateChat ?? currentConfig.behavior.privateChat,
+      groupAtOnly: maybeGroupAtOnly ?? currentConfig.behavior.groupAtOnly,
+      userWhitelist: maybeUserWhitelist ?? currentConfig.behavior.userWhitelist.join(','),
+      groupWhitelist: maybeGroupWhitelist ?? currentConfig.behavior.groupWhitelist.join(','),
+      debounceMs: maybeDebounceMs ?? currentConfig.behavior.debounceMs,
+      groupSessionMode: maybeGroupSessionMode ?? currentConfig.behavior.groupSessionMode,
+    };
+    currentConfig = unflattenConfig(flatConfig);
+  } else {
+    currentConfig = deepMerge(currentConfig, config);
+  }
   if (gatewayClient) {
     gatewayClient.disconnect();
     gatewayClient = null;

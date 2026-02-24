@@ -217,6 +217,13 @@ export class GatewayClient {
 
     this.connectPromise = new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
+        if (this.ws && this.ws.readyState !== WebSocket.CLOSED) {
+          try {
+            this.ws.close(4001, 'connect timeout');
+          } catch {
+            // ignore close errors on timeout path
+          }
+        }
         reject(new Error('connect timeout'));
         this.connectPromise = null;
       }, 15000);
