@@ -9,15 +9,19 @@
  */
 
 import { randomUUID } from 'crypto';
-import { exec } from 'child_process';
+import { execFile } from 'child_process';
 import { promisify } from 'util';
+import dns from 'dns/promises';
 import fs from 'fs';
+import http from 'http';
+import https from 'https';
+import net from 'net';
 import path from 'path';
 import { GatewayClient } from './gateway-client';
 import { DEFAULT_CONFIG, buildConfigSchema } from './config';
-import type { PluginConfig, ExtractedMedia, ChatEventPayload, ContentBlock } from './types';
+import type { PluginConfig, ExtractedMedia, ChatEventPayload, ContentBlock, SavedMedia, DebounceResult } from './types';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // ========== State ==========
 let logger: any = null;
@@ -25,6 +29,19 @@ let configPath: string | null = null;
 let botUserId: string | number | null = null;
 let gatewayClient: GatewayClient | null = null;
 let currentConfig: PluginConfig = { ...DEFAULT_CONFIG };
+let lastCtx: any = null;
+let pluginDir = '/tmp';
+let pushListenerAttached = false;
+
+const debounceBuffers = new Map<
+  string,
+  {
+    messages: string[];
+    media: ExtractedMedia[];
+    timer: ReturnType<typeof setTimeout>;
+    resolve: (value: DebounceResult | null) => void;
+  }
+>();
 
 // ========== Local Commands ==========
 
@@ -73,6 +90,7 @@ const sessionEpochs = new Map<string, number>();
 
 function getSessionBase(messageType: string, userId: number | string, groupId?: number | string): string {
   if (messageType === 'private') return `qq-${userId}`;
+  if (currentConfig.behavior.groupSessionMode === 'shared') return `qq-g${groupId}`;
   return `qq-g${groupId}-${userId}`;
 }
 
@@ -93,8 +111,47 @@ async function getGateway(): Promise<GatewayClient> {
   }
   if (!gatewayClient.connected) {
     await gatewayClient.connect();
+    if (!pushListenerAttached) {
+      setupAgentPushListener(gatewayClient);
+      pushListenerAttached = true;
+    }
   }
   return gatewayClient;
+}
+
+function debounceMessage(
+  sessionBase: string,
+  text: string,
+  media: ExtractedMedia[],
+  debounceMs: number
+): Promise<DebounceResult | null> {
+  return new Promise((resolve) => {
+    let buf = debounceBuffers.get(sessionBase);
+    if (buf) {
+      if (text) buf.messages.push(text);
+      if (media.length > 0) buf.media.push(...media);
+      clearTimeout(buf.timer);
+      const prevResolve = buf.resolve;
+      buf.resolve = resolve;
+      prevResolve(null);
+    } else {
+      buf = {
+        messages: text ? [text] : [],
+        media: [...media],
+        resolve,
+        timer: setTimeout(() => undefined, 0),
+      };
+      debounceBuffers.set(sessionBase, buf);
+    }
+
+    buf.timer = setTimeout(() => {
+      debounceBuffers.delete(sessionBase);
+      buf!.resolve({
+        text: buf!.messages.join('\n'),
+        media: buf!.media,
+      });
+    }, debounceMs);
+  });
 }
 
 // ========== Message Extraction ==========
@@ -282,13 +339,272 @@ async function sendReply(ctx: any, messageType: string, groupId: any, userId: an
   }
 }
 
+async function sendImageMsg(
+  ctx: any,
+  messageType: string,
+  groupId: number | string | null,
+  userId: number | string | null,
+  imageUrl: string
+): Promise<void> {
+  const message = [{ type: 'image', data: { url: imageUrl } }];
+  if (messageType === 'group') {
+    await ctx.actions.call(
+      'send_group_msg',
+      { group_id: String(groupId), message },
+      ctx.adapterName,
+      ctx.pluginManager?.config
+    );
+    return;
+  }
+  await ctx.actions.call(
+    'send_private_msg',
+    { user_id: String(userId), message },
+    ctx.adapterName,
+    ctx.pluginManager?.config
+  );
+}
+
+async function sendGroupMsg(ctx: any, groupId: string | number, text: string): Promise<void> {
+  await ctx.actions.call(
+    'send_group_msg',
+    { group_id: String(groupId), message: text },
+    ctx.adapterName,
+    ctx.pluginManager?.config
+  );
+}
+
+async function sendPrivateMsg(ctx: any, userId: string | number, text: string): Promise<void> {
+  await ctx.actions.call(
+    'send_private_msg',
+    { user_id: String(userId), message: text },
+    ctx.adapterName,
+    ctx.pluginManager?.config
+  );
+}
+
+function isPrivateIp(host: string): boolean {
+  if (!host) return true;
+  const normalized = host.trim().toLowerCase();
+  if (normalized === 'localhost' || normalized === 'ip6-localhost') return true;
+
+  const ipVersion = net.isIP(normalized);
+  if (ipVersion === 4) {
+    if (normalized.startsWith('127.')) return true;
+    if (normalized.startsWith('10.')) return true;
+    if (normalized.startsWith('192.168.')) return true;
+    if (normalized.startsWith('169.254.')) return true;
+    const parts = normalized.split('.').map(Number);
+    if (parts.length === 4 && parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+    return false;
+  }
+  if (ipVersion === 6) {
+    if (normalized === '::1') return true;
+    return normalized.startsWith('fc') || normalized.startsWith('fd');
+  }
+  return false;
+}
+
+async function assertSafeRemoteUrl(rawUrl: string): Promise<URL> {
+  const parsed = new URL(rawUrl);
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    throw new Error(`unsupported protocol: ${parsed.protocol}`);
+  }
+  if (!parsed.hostname) {
+    throw new Error('invalid hostname');
+  }
+  if (isPrivateIp(parsed.hostname)) {
+    throw new Error('private network address is not allowed');
+  }
+  const records = await dns.lookup(parsed.hostname, { all: true });
+  if (!records.length) {
+    throw new Error('hostname resolution failed');
+  }
+  for (const record of records) {
+    if (isPrivateIp(record.address)) {
+      throw new Error('resolved private network address is not allowed');
+    }
+  }
+  return parsed;
+}
+
+async function downloadToBuffer(url: string, maxBytes = 5 * 1024 * 1024, redirectCount = 0): Promise<Buffer> {
+  if (redirectCount > 5) {
+    throw new Error('too many redirects');
+  }
+  const parsed = await assertSafeRemoteUrl(url);
+  return new Promise((resolve, reject) => {
+    const mod = parsed.protocol === 'https:' ? https : http;
+    const req = mod.get(parsed.toString(), { timeout: 10000 }, (res) => {
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const nextUrl = new URL(res.headers.location, parsed).toString();
+        res.resume();
+        void downloadToBuffer(nextUrl, maxBytes, redirectCount + 1).then(resolve).catch(reject);
+        return;
+      }
+      if (res.statusCode !== 200) {
+        res.resume();
+        reject(new Error(`HTTP ${res.statusCode}`));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let total = 0;
+      res.on('data', (chunk: Buffer) => {
+        total += chunk.length;
+        if (total > maxBytes) {
+          res.destroy();
+          reject(new Error(`exceeds ${maxBytes} bytes`));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('error', reject);
+    });
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('timeout'));
+    });
+    req.on('error', reject);
+  });
+}
+
+function guessMimeFromUrl(url?: string): string {
+  const ext = (url || '').split('?')[0].split('.').pop()?.toLowerCase();
+  const mimeMap: Record<string, string> = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    bmp: 'image/bmp',
+  };
+  return mimeMap[ext || ''] || 'image/png';
+}
+
+async function saveMediaToCache(mediaList: ExtractedMedia[], ctx: any): Promise<SavedMedia[]> {
+  const cacheDir = path.join(pluginDir || '/tmp', 'cache', 'media');
+  await fs.promises.mkdir(cacheDir, { recursive: true });
+
+  const saved: SavedMedia[] = [];
+  for (const m of mediaList) {
+    try {
+      let buf: Buffer | null = null;
+      if (m.url) {
+        buf = await downloadToBuffer(m.url, 10 * 1024 * 1024);
+      } else if (m.file_id && ctx) {
+        try {
+          const fileInfo = await ctx.actions.call(
+            'get_file',
+            { file_id: m.file_id },
+            ctx.adapterName,
+            ctx.pluginManager?.config
+          );
+          if (fileInfo?.file) {
+            try {
+              await fs.promises.access(fileInfo.file);
+              buf = await fs.promises.readFile(fileInfo.file);
+            } catch {
+              if (fileInfo.url) buf = await downloadToBuffer(fileInfo.url, 10 * 1024 * 1024);
+              else if (fileInfo.base64) buf = Buffer.from(fileInfo.base64, 'base64');
+            }
+          }
+        } catch (e: any) {
+          logger?.warn(`[OpenClaw] get_file 失败: ${e.message}`);
+        }
+      }
+
+      if (!buf) {
+        saved.push({ type: m.type, path: null, url: m.url, name: m.name });
+        continue;
+      }
+      let ext = 'bin';
+      if (m.type === 'image') ext = guessMimeFromUrl(m.url).split('/')[1] || 'png';
+      else if (m.name) ext = m.name.split('.').pop() || 'bin';
+      else if (m.type === 'voice') ext = 'silk';
+      else if (m.type === 'video') ext = 'mp4';
+
+      const filename = `${Date.now()}-${randomUUID().slice(0, 8)}.${ext}`;
+      const filePath = path.join(cacheDir, filename);
+      await fs.promises.writeFile(filePath, buf);
+      saved.push({ type: m.type, path: filePath, name: m.name || filename, size: buf.length });
+    } catch (e: any) {
+      logger?.warn(`[OpenClaw] 下载文件失败: ${e.message}`);
+      saved.push({ type: m.type, path: null, url: m.url, name: m.name });
+    }
+  }
+
+  try {
+    const cutoff = Date.now() - 3600000;
+    const files = await fs.promises.readdir(cacheDir);
+    for (const name of files) {
+      const fullPath = path.join(cacheDir, name);
+      const stat = await fs.promises.stat(fullPath);
+      if (stat.mtimeMs < cutoff) await fs.promises.unlink(fullPath);
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+
+  return saved;
+}
+
+function extractImagesFromReply(text: string): { images: string[]; cleanText: string } {
+  const images: string[] = [];
+  const mediaRegex = /^MEDIA:\s*(.+)$/gm;
+  let match: RegExpExecArray | null;
+  while ((match = mediaRegex.exec(text)) !== null) {
+    const url = match[1].trim();
+    if (url.startsWith('http')) images.push(url);
+  }
+  const mdRegex = /!\[[^\]]*\]\(([^)]+)\)/g;
+  while ((match = mdRegex.exec(text)) !== null) {
+    const url = match[1].trim();
+    if (url.startsWith('http')) images.push(url);
+  }
+  const cleanText = text
+    .replace(/^MEDIA:\s*.+$/gm, '')
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .trim();
+  return { images: Array.from(new Set(images)), cleanText };
+}
+
+function setupAgentPushListener(gw: GatewayClient): void {
+  gw.eventHandlers.set('chat', (payload: ChatEventPayload) => {
+    if (!payload || payload.state !== 'final' || !payload.sessionKey) return;
+    if (!payload.sessionKey.startsWith('qq-')) return;
+    if (payload.runId && gw.chatWaiters.has(payload.runId)) return;
+    if (!lastCtx) return;
+
+    const text = extractContentText(payload.message).trim();
+    if (!text) return;
+    logger?.info(`[OpenClaw] Agent 主动推送: ${payload.sessionKey} -> ${text.slice(0, 50)}`);
+
+    const privateMatch = payload.sessionKey.match(/^qq-(\d+)(?:-\d+)?$/);
+    if (privateMatch && !payload.sessionKey.includes('-g')) {
+      const { images, cleanText } = extractImagesFromReply(text);
+      if (cleanText) void sendPrivateMsg(lastCtx, privateMatch[1], cleanText);
+      for (const img of images) void sendImageMsg(lastCtx, 'private', null, privateMatch[1], img);
+      return;
+    }
+
+    const groupMatch = payload.sessionKey.match(/^qq-g(\d+)/);
+    if (groupMatch) {
+      const { images, cleanText } = extractImagesFromReply(text);
+      if (cleanText) void sendGroupMsg(lastCtx, groupMatch[1], cleanText);
+      for (const img of images) void sendImageMsg(lastCtx, 'group', groupMatch[1], null, img);
+    }
+  });
+}
+
 // ========== Lifecycle ==========
 
 export let plugin_config_ui: any[] = [];
 
 export const plugin_init = async (ctx: any): Promise<void> => {
   logger = ctx.logger;
+  lastCtx = ctx;
   configPath = ctx.configPath;
+  pluginDir = new URL('.', import.meta.url).pathname;
   logger.info('[OpenClaw] QQ Channel 插件初始化中...');
 
   // Load saved config
@@ -360,8 +676,9 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
     if (!shouldHandle) return;
 
-    const { extractedText, extractedMedia } = extractMessage(event.message || []);
-    const text = extractedText;
+    lastCtx = ctx;
+    let { extractedText, extractedMedia } = extractMessage(event.message || []);
+    let text = extractedText;
     if (!text && extractedMedia.length === 0) return;
 
     const sessionBase = getSessionBase(messageType, userId, groupId);
@@ -382,11 +699,34 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       }
     }
 
+    const debounceMsRaw = currentConfig.behavior.debounceMs;
+    const debounceMs = Number.isFinite(debounceMsRaw) ? debounceMsRaw : 2000;
+    if (debounceMs > 0 && !(text && text.startsWith('/'))) {
+      const merged = await debounceMessage(sessionBase, text || '', extractedMedia, debounceMs);
+      if (!merged) return;
+      extractedText = merged.text;
+      extractedMedia = merged.media;
+      text = extractedText;
+      if (!text && extractedMedia.length === 0) return;
+    }
+
     // Build message
-    let openclawMessage = text;
+    let openclawMessage = text || '';
     if (extractedMedia.length > 0) {
-      const mediaInfo = extractedMedia.map((m) => `[${m.type}: ${m.url}]`).join('\n');
-      openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+      const savedMedia = await saveMediaToCache(extractedMedia, ctx);
+      if (savedMedia.length > 0) {
+        const mediaInfo = savedMedia.map((m) => {
+          if (m.path) {
+            if (m.type === 'image') return `[用户发送了图片: ${m.path}]`;
+            if (m.type === 'file') return `[用户发送了文件「${m.name}」: ${m.path}]`;
+            if (m.type === 'voice') return `[用户发送了语音: ${m.path}]`;
+            if (m.type === 'video') return `[用户发送了视频: ${m.path}]`;
+            return `[用户发送了${m.type}: ${m.path}]`;
+          }
+          return `[用户发送了${m.type}: ${m.url}]`;
+        }).join('\n');
+        openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+      }
     }
 
     logger.info(
@@ -403,9 +743,11 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
     const runId = randomUUID();
     const runStartedAtMs = Date.now();
 
+    let gw: GatewayClient | null = null;
+    let waitRunId = runId;
     try {
-      const gw = await getGateway();
-      let waitRunId = runId;
+      gw = await getGateway();
+      const gwClient = gw;
 
       // 按 runId 监听 chat 事件，避免多个会话并发时全局 handler 被覆盖
       const replyPromise = new Promise<string | null>((resolve) => {
@@ -429,7 +771,7 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
           if (settled || recovering) return;
           recovering = true;
           try {
-            const historyText = await resolveReplyFromHistory(gw, latestSessionKey, runStartedAtMs, {
+            const historyText = await resolveReplyFromHistory(gwClient, latestSessionKey, runStartedAtMs, {
               maxAttempts,
               intervalMs,
               shouldStop: () => settled,
@@ -453,10 +795,10 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 
         const cleanup = () => {
           clearTimeout(timeout);
-          gw.chatWaiters.delete(waitRunId);
+          gwClient.chatWaiters.delete(waitRunId);
         };
 
-        gw.chatWaiters.set(waitRunId, { handler: (payload: any) => {
+        gwClient.chatWaiters.set(waitRunId, { handler: (payload: any) => {
           if (settled) return;
           if (!payload) return;
           if (typeof payload.sessionKey === 'string' && payload.sessionKey.trim()) {
@@ -504,7 +846,7 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       });
 
       // Send message
-      const sendResult = await gw.request('chat.send', {
+      const sendResult = await gwClient.request('chat.send', {
         sessionKey,
         message: openclawMessage,
         idempotencyKey: runId,
@@ -513,11 +855,11 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
       const actualRunId = typeof sendResult?.runId === 'string' && sendResult.runId ? sendResult.runId : runId;
       if (actualRunId !== waitRunId) {
-        const waiter = gw.chatWaiters.get(waitRunId);
+        const waiter = gwClient.chatWaiters.get(waitRunId);
         if (waiter) {
-          gw.chatWaiters.delete(waitRunId);
+          gwClient.chatWaiters.delete(waitRunId);
           waitRunId = actualRunId;
-          gw.chatWaiters.set(waitRunId, waiter);
+          gwClient.chatWaiters.set(waitRunId, waiter);
         }
         logger.warn(
           `[OpenClaw] runId 重映射: local=${runId.slice(0, 8)} server=${actualRunId.slice(0, 8)}`
@@ -528,26 +870,45 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       const reply = await replyPromise;
 
       if (reply) {
-        await sendReply(ctx, messageType, groupId, userId, reply);
+        const { images, cleanText } = extractImagesFromReply(reply);
+        if (cleanText) {
+          await sendReply(ctx, messageType, groupId, userId, cleanText);
+        }
+        for (const imageUrl of images) {
+          try {
+            await sendImageMsg(ctx, messageType, groupId ?? null, userId ?? null, imageUrl);
+          } catch (e: any) {
+            logger?.warn(`[OpenClaw] 发送图片失败: ${e.message}`);
+          }
+        }
       } else {
         logger.warn('[OpenClaw] 无回复内容，返回兜底提示');
         await sendReply(ctx, messageType, groupId, userId, '⚠️ 模型未返回内容，请稍后重试。');
       }
     } catch (e: any) {
+      if (gw && waitRunId) {
+        gw.chatWaiters.delete(waitRunId);
+      }
       logger.error(`[OpenClaw] 发送失败: ${e.message}`);
       if (gatewayClient) {
         gatewayClient.disconnect();
         gatewayClient = null;
+        pushListenerAttached = false;
       }
       try {
-        const escapedMessage = openclawMessage.replace(/'/g, "'\\''");
-        const cliPath = currentConfig.openclaw.cliPath;
-        const { stdout } = await execAsync(
-          `OPENCLAW_TOKEN='${currentConfig.openclaw.token}' ${cliPath} agent --session-id '${sessionKey}' --message '${escapedMessage}' 2>&1`,
-          { timeout: 180000, maxBuffer: 1024 * 1024 }
+        const cliPath = currentConfig.openclaw.cliPath || '/root/.nvm/versions/node/v22.22.0/bin/openclaw';
+        const { stdout, stderr } = await execFileAsync(
+          cliPath,
+          ['agent', '--session-id', sessionKey, '--message', openclawMessage],
+          {
+            env: { ...process.env, OPENCLAW_TOKEN: currentConfig.openclaw.token || '' },
+            timeout: 180000,
+            maxBuffer: 1024 * 1024,
+          }
         );
-        if (stdout.trim()) {
-          await sendReply(ctx, messageType, groupId, userId, stdout.trim());
+        const fallbackOutput = [stdout, stderr].filter(Boolean).join('\n').trim();
+        if (fallbackOutput) {
+          await sendReply(ctx, messageType, groupId, userId, fallbackOutput);
         }
       } catch (e2: any) {
         await sendReply(ctx, messageType, groupId, userId, `处理出错: ${(e as Error).message?.slice(0, 100)}`);
@@ -563,10 +924,16 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
 };
 
 export const plugin_cleanup = async (): Promise<void> => {
+  for (const [, entry] of debounceBuffers) {
+    clearTimeout(entry.timer);
+  }
+  debounceBuffers.clear();
   if (gatewayClient) {
     gatewayClient.disconnect();
     gatewayClient = null;
+    pushListenerAttached = false;
   }
+  pushListenerAttached = false;
   logger?.info('[OpenClaw] QQ Channel 插件清理完成');
 };
 
@@ -590,6 +957,11 @@ function flattenConfig(cfg: PluginConfig): Record<string, any> {
 
 // Unflatten flat WebUI config back to nested structure
 function unflattenConfig(flat: Record<string, any>): PluginConfig {
+  const parseDebounceMs = (value: any): number => {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) return parsed;
+    return 2000;
+  };
   const parseNumList = (s: any): number[] => {
     if (Array.isArray(s)) return s.map(Number).filter(Boolean);
     if (typeof s === 'string' && s.trim()) return s.split(',').map((x: string) => Number(x.trim())).filter(Boolean);
@@ -606,7 +978,7 @@ function unflattenConfig(flat: Record<string, any>): PluginConfig {
       groupAtOnly: flat.groupAtOnly !== false,
       userWhitelist: parseNumList(flat.userWhitelist),
       groupWhitelist: parseNumList(flat.groupWhitelist),
-      debounceMs: Number(flat.debounceMs) || 2000,
+      debounceMs: parseDebounceMs(flat.debounceMs),
       groupSessionMode: flat.groupSessionMode === 'shared' ? 'shared' : 'user',
     },
   };
