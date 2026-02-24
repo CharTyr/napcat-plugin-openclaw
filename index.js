@@ -1,3 +1,4 @@
+// Standalone version - NOT used by vite build. See src/index.ts for canonical source.
 // NapCat Plugin: OpenClaw QQ Channel
 // 通过 WebSocket RPC 协议与 OpenClaw Gateway 通信
 // 支持 chat.send（gateway 自动处理斜杠命令）
