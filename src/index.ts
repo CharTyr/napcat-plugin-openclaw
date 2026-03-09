@@ -604,7 +604,18 @@ export const plugin_init = async (ctx: any): Promise<void> => {
   logger = ctx.logger;
   lastCtx = ctx;
   configPath = ctx.configPath;
-  pluginDir = new URL('.', import.meta.url).pathname;
+  // import.meta.url may become a data: URI after bundling (Vite asset inlining),
+  // which produces an absurdly long pathname and triggers ENAMETOOLONG on mkdir.
+  try {
+    const metaUrl = import.meta.url;
+    if (metaUrl && metaUrl.startsWith('file:')) {
+      pluginDir = new URL('.', metaUrl).pathname;
+    } else {
+      pluginDir = '/tmp';
+    }
+  } catch {
+    pluginDir = '/tmp';
+  }
   logger.info('[OpenClaw] QQ Channel 插件初始化中...');
 
   // Load saved config

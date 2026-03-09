@@ -104,7 +104,20 @@ function signDevicePayload(privateKeyPem: string, payload: string): string {
 function resolveDeviceIdentityPath(): string {
   const envPath = process.env.OPENCLAW_DEVICE_IDENTITY_PATH?.trim();
   if (envPath) return envPath;
-  const moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+  // import.meta.url may become a data: URI after bundling (e.g. Vite inlining),
+  // which makes fileURLToPath produce an absurdly long or invalid path.
+  let moduleDir: string;
+  try {
+    const metaUrl = import.meta.url;
+    if (metaUrl && metaUrl.startsWith('file:')) {
+      moduleDir = path.dirname(fileURLToPath(metaUrl));
+    } else {
+      moduleDir = process.cwd();
+    }
+  } catch {
+    moduleDir = process.cwd();
+  }
   return path.join(moduleDir, '.openclaw-device.json');
 }
 
