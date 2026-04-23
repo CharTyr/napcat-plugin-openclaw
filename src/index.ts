@@ -721,22 +721,25 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
       if (!text && extractedMedia.length === 0) return;
     }
 
-    // Build message
+    // Build message & cache media
     let openclawMessage = text || '';
+    let savedMedia: any[] = [];
     if (extractedMedia.length > 0) {
-      const savedMedia = await saveMediaToCache(extractedMedia, ctx);
+      savedMedia = await saveMediaToCache(extractedMedia, ctx);
       if (savedMedia.length > 0) {
-        const mediaInfo = savedMedia.map((m) => {
-          if (m.path) {
-            if (m.type === 'image') return `[用户发送了图片: ${m.path}]`;
+        // 图片已通过 attachments 传递，不需要文本引用；文件/语音/视频仍需文本提示
+        const mediaInfo = savedMedia
+          .filter((m) => m.path && m.type !== 'image')
+          .map((m) => {
             if (m.type === 'file') return `[用户发送了文件「${m.name}」: ${m.path}]`;
             if (m.type === 'voice') return `[用户发送了语音: ${m.path}]`;
             if (m.type === 'video') return `[用户发送了视频: ${m.path}]`;
             return `[用户发送了${m.type}: ${m.path}]`;
-          }
-          return `[用户发送了${m.type}: ${m.url}]`;
-        }).join('\n');
-        openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+          })
+          .join('\n');
+        if (mediaInfo) {
+          openclawMessage = openclawMessage ? `${openclawMessage}\n\n${mediaInfo}` : mediaInfo;
+        }
       }
     }
 
@@ -856,11 +859,31 @@ export const plugin_onmessage = async (ctx: any, event: any): Promise<void> => {
         }});
       });
 
+      // Build attachments (base64 image files from cache)
+      const attachments: any[] = [];
+      for (const m of savedMedia) {
+        if (!m.path) continue;
+        try {
+          const buf = await fs.promises.readFile(m.path);
+          const b64 = buf.toString('base64');
+          const mime = m.type === 'image' ? guessMimeFromUrl(m.url) || 'image/png' : undefined;
+          attachments.push({
+            type: m.type,
+            mimeType: mime,
+            fileName: m.name,
+            content: b64,
+          });
+        } catch (e: any) {
+          logger?.warn(`[OpenClaw] 读取缓存图片失败: ${e.message}`);
+        }
+      }
+
       // Send message
       const sendResult = await gwClient.request('chat.send', {
         sessionKey,
         message: openclawMessage,
         idempotencyKey: runId,
+        ...(attachments.length > 0 ? { attachments } : {}),
       });
 
       logger.info(`[OpenClaw] chat.send 已接受: runId=${sendResult?.runId}`);
